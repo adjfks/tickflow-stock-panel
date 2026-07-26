@@ -108,6 +108,57 @@ def test_custom_financial_provider_receives_shares_contract(monkeypatch):
     assert received == [("shares", ["600000.SH"], False)]
 
 
+def test_custom_financial_provider_receives_full_metrics_history_contract(monkeypatch):
+    received: list[tuple[str, list[str], bool]] = []
+
+    class Provider:
+        def get_financials(self, table, symbols, latest_only=True):
+            received.append((table, symbols, latest_only))
+            return pl.DataFrame({
+                "symbol": symbols,
+                "period_end": ["2024-06-30"],
+                "announce_date": ["2024-08-20"],
+                "roe": [0.1],
+            })
+
+    from app.data_providers import custom as custom_sources
+    from app.services import preferences
+
+    monkeypatch.setattr(financial_sync, "_financial_is_custom", lambda: True)
+    monkeypatch.setattr(preferences, "get_financial_provider", lambda: "custom-test")
+    monkeypatch.setattr(custom_sources, "get_provider", lambda _name: Provider())
+
+    result = financial_sync._fetch_table(
+        "metrics",
+        ["600000.SH"],
+        CapabilitySet(),
+        latest_only=False,
+    )
+
+    assert result.height == 1
+    assert received == [("metrics", ["600000.SH"], False)]
+
+
+def test_financial_history_deduplicates_by_announcement_date():
+    old = pl.DataFrame({
+        "symbol": ["600000.SH"],
+        "period_end": ["2023-12-31"],
+        "announce_date": ["2024-04-15"],
+        "roe": [0.08],
+    })
+    revised = pl.DataFrame({
+        "symbol": ["600000.SH", "600000.SH"],
+        "period_end": ["2023-12-31", "2023-12-31"],
+        "announce_date": ["2024-04-15", "2024-05-10"],
+        "roe": [0.09, 0.10],
+    })
+
+    merged = financial_sync._merge_financial_history(old, revised)
+
+    assert merged.height == 2
+    assert merged.sort("announce_date")["roe"].to_list() == [0.09, 0.10]
+
+
 def test_historical_turnover_uses_only_available_share_capital(monkeypatch):
     monkeypatch.setattr(pipeline, "cn_today", lambda: date(2026, 7, 18))
     bars = pl.DataFrame({

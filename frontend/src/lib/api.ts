@@ -418,6 +418,11 @@ export interface StrategyParamDef {
   max?: number
   step?: number
   options?: string[]
+  option_labels?: Record<string, string>
+  unit?: 'percent' | string
+  group?: 'strategy' | 'risk' | string
+  depends_on?: string
+  optimizable?: boolean
 }
 
 export interface StrategyDetail {
@@ -691,6 +696,17 @@ export interface StrategyBacktestTrade {
   blocked_exit_days?: number
   entry_signal_id?: string | null
   exit_signal_id?: string | null
+  exit_legs?: {
+    date: string
+    signal_date?: string
+    target_position_ratio: number
+    sold_shares: number
+    price: number
+    fee: number
+    reason: string
+    signal_id?: string | null
+    remaining_position_ratio: number
+  }[]
 }
 
 export interface StrategyBacktestResult {
@@ -1515,6 +1531,7 @@ export const api = {
     slippage_bps?: number
     max_positions?: number
     initial_capital?: number
+    benchmark_symbol?: string
     position_sizing?: 'equal' | 'score_weight'
     asset_type?: 'stock' | 'etf'
     minute_fill?: boolean

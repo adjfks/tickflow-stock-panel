@@ -86,6 +86,22 @@ def test_unknown_param_rejected():
         expand_param_grid(PARAMS_META, {"nonexistent": [1, 2]})
 
 
+def test_explicit_optimization_contract_only_allows_marked_numeric_params():
+    meta = [
+        {"id": "period", "type": "int", "default": 10, "optimizable": True},
+        {"id": "enabled", "type": "bool", "default": True, "optimizable": True},
+        {"id": "threshold", "type": "float", "default": 0.1, "optimizable": False},
+    ]
+    assert expand_param_grid(meta, {"period": [5, 10]}) == [
+        {"period": 5},
+        {"period": 10},
+    ]
+    with pytest.raises(ValueError, match="不是数值参数"):
+        expand_param_grid(meta, {"enabled": [True, False]})
+    with pytest.raises(ValueError, match="未标记"):
+        expand_param_grid(meta, {"threshold": [0.1, 0.2]})
+
+
 def test_value_out_of_range_rejected():
     with pytest.raises(ValueError, match=r"超出范围|范围"):
         expand_param_grid(PARAMS_META, {"ma_proximity": [0.01, 0.99]})

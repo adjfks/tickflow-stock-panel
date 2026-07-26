@@ -1,7 +1,7 @@
 import { useState, useMemo, useEffect, useRef, type ReactNode } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Play, FlaskConical, Clock, Loader2, Square, Search, Plus, X, SlidersHorizontal, BarChart3, Gauge, Zap, ListPlus, HelpCircle, ChevronRight, AlertTriangle } from 'lucide-react'
+import { Play, FlaskConical, Clock, Loader2, Square, Search, Plus, X, SlidersHorizontal, BarChart3, Gauge, Zap, ListPlus, HelpCircle, ChevronRight, AlertTriangle, Download } from 'lucide-react'
 import {
   api,
   type StrategyBacktestResult,
@@ -33,7 +33,7 @@ const monthsAgo = (months: number) => {
   return formatDate(date)
 }
 const TODAY = formatDate(new Date())
-const THREE_MONTHS_AGO = monthsAgo(3)
+const THREE_YEARS_AGO = monthsAgo(36)
 
 type QuickRangeUnit = 'month' | 'year' | 'all'
 type QuickRangeConfig = { id: string; enabled: boolean; unit: QuickRangeUnit; value: number }
@@ -634,22 +634,76 @@ function ScoringWeightRow({ name, weight, pct, editing, onChange }: {
   )
 }
 
-function StrategyParamInput({ param, value, onChange }: {
+function validateStrategyParamValues(
+  definitions: StrategyParamDef[],
+  values: Record<string, any>,
+): string[] {
+  const errors: string[] = []
+  const resolved = Object.fromEntries(
+    definitions.map(param => [param.id, values[param.id] ?? param.default]),
+  )
+  for (const param of definitions) {
+    const value = resolved[param.id]
+    if (param.type === 'bool') {
+      if (typeof value !== 'boolean') errors.push(`${param.label}必须为开关值`)
+      continue
+    }
+    if (param.type === 'select') {
+      if (!param.options?.includes(String(value))) errors.push(`${param.label}选项无效`)
+      continue
+    }
+    const numeric = Number(value)
+    if (value === '' || !Number.isFinite(numeric)) {
+      errors.push(`${param.label}必须是有效数字`)
+      continue
+    }
+    if (param.type === 'int' && !Number.isInteger(numeric)) errors.push(`${param.label}必须是整数`)
+    if (param.min != null && numeric < param.min) errors.push(`${param.label}不能小于 ${param.min}`)
+    if (param.max != null && numeric > param.max) errors.push(`${param.label}不能大于 ${param.max}`)
+  }
+
+  const has = (id: string) => definitions.some(param => param.id === id)
+  const numberValue = (id: string) => Number(resolved[id])
+  const maIds = ['ma_fast_period', 'ma_short_period', 'ma_mid_period', 'ma_trend_period', 'ma_long_period']
+  if (maIds.every(has)) {
+    const periods = maIds.map(numberValue)
+    if (periods.some((value, index) => index > 0 && value <= periods[index - 1])) {
+      errors.push('均线周期必须满足快速 < 短期 < 中期 < 趋势 < 长期')
+    }
+  }
+  if (has('first_target_ratio') && has('second_target_ratio')) {
+    const first = numberValue('first_target_ratio')
+    const second = numberValue('second_target_ratio')
+    if (!(0 <= second && second <= first && first <= 1)) {
+      errors.push('仓位目标必须满足 0% ≤ 二级 ≤ 一级 ≤ 100%')
+    }
+  }
+  if (has('profit_activation_1') && has('profit_activation_2')) {
+    if (numberValue('profit_activation_2') < numberValue('profit_activation_1')) {
+      errors.push('二级盈利激活点不能低于一级盈利激活点')
+    }
+  }
+  return [...new Set(errors)]
+}
+
+function StrategyParamInput({ param, value, onChange, disabled = false }: {
   param: StrategyParamDef
   value: any
   onChange: (value: any) => void
+  disabled?: boolean
 }) {
   if (param.type === 'bool') {
-    const checked = value === true || value === 'true' || value === 'True' || value === true
+    const checked = value === true || value === 'true' || value === 'True'
     return (
       <label className="block">
         <span className="mb-1 block text-[11px] text-secondary">{param.label}</span>
         <button
           type="button"
+          disabled={disabled}
           onClick={() => onChange(!checked)}
           className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors duration-200 cursor-pointer ${
             checked ? 'bg-accent shadow-[0_0_6px_rgba(59,130,246,0.3)]' : 'bg-elevated'
-          }`}
+          } ${disabled ? 'cursor-not-allowed opacity-45' : ''}`}
           aria-pressed={checked}
         >
           <span className={`inline-block h-4 w-4 rounded-full bg-white shadow-sm transition-transform duration-200 ${
@@ -663,28 +717,32 @@ function StrategyParamInput({ param, value, onChange }: {
     return (
       <label className="block">
         <span className="mb-1 block text-[11px] text-secondary">{param.label}</span>
-        <select value={value ?? param.default} onChange={e => onChange(e.target.value)} className={INPUT_CLS}>
-          {(param.options ?? []).map(opt => <option key={opt} value={opt}>{opt}</option>)}
+        <select disabled={disabled} value={value ?? param.default} onChange={e => onChange(e.target.value)} className={`${INPUT_CLS} disabled:cursor-not-allowed disabled:opacity-45`}>
+          {(param.options ?? []).map(opt => <option key={opt} value={opt}>{param.option_labels?.[opt] ?? opt}</option>)}
         </select>
       </label>
     )
   }
+  const percent = param.unit === 'percent'
+  const scale = percent ? 100 : 1
+  const displayValue = value === '' || value == null ? '' : Number(value) * scale
   return (
     <label className="block">
-      <span className="mb-1 block text-[11px] text-secondary">{param.label}</span>
+      <span className="mb-1 block text-[11px] text-secondary">{param.label}{percent ? '(%)' : ''}</span>
       <input
         type="number"
-        value={value ?? ''}
-        min={param.min}
-        max={param.max}
-        step={param.step ?? (param.type === 'int' ? 1 : 0.01)}
+        disabled={disabled}
+        value={displayValue}
+        min={param.min == null ? undefined : param.min * scale}
+        max={param.max == null ? undefined : param.max * scale}
+        step={(param.step ?? (param.type === 'int' ? 1 : 0.01)) * scale}
         onChange={e => {
           const n = numOrNull(e.target.value)
           if (n == null) return onChange('')
-          const next = clamp(n, param.min, param.max)
+          const next = clamp(n / scale, param.min, param.max)
           onChange(param.type === 'int' ? Math.round(next) : next)
         }}
-        className={INPUT_CLS}
+        className={`${INPUT_CLS} disabled:cursor-not-allowed disabled:opacity-45`}
       />
     </label>
   )
@@ -840,7 +898,7 @@ export function StrategyBacktest() {
   const [strategyGroup, setStrategyGroup] = useState<StrategyGroup>('all')
   const [symbols, setSymbols] = useState(saved?.symbols ?? '')
   const [assetType, setAssetType] = useState<'stock' | 'etf'>(saved?.assetType ?? 'stock')
-  const [start, setStart] = useState(saved?.start ?? THREE_MONTHS_AGO)
+  const [start, setStart] = useState(saved?.start ?? THREE_YEARS_AGO)
   const [end, setEnd] = useState(saved?.end ?? TODAY)
   // 成交口径: 建仓/清仓可独立配置。向后兼容老 matching (派生为 entry=exit=matching)。
   const [matching] = useState<'close_t' | 'open_t+1'>(saved?.matching ?? 'open_t+1')
@@ -848,12 +906,13 @@ export function StrategyBacktest() {
   const [exitFill, setExitFill] = useState<'close_t' | 'open_t+1' | 'signal_next_minute'>(
     saved ? (saved.exitFill ?? saved.matching ?? 'close_t') : 'open_t+1',
   )
-  const [fees, setFees] = useState(saved?.fees ?? '2')
-  const [stampTax, setStampTax] = useState(saved?.stampTax ?? '1')
+  const [fees, setFees] = useState(saved?.fees ?? '3')
+  const [stampTax, setStampTax] = useState(saved?.stampTax ?? '0.5')
   const [slippage, setSlippage] = useState(saved?.slippage ?? '5')
   const [maxPositions, setMaxPositions] = useState(saved?.maxPositions ?? '10')
   const [maxExposure, setMaxExposure] = useState(saved?.maxExposure ?? '100')
   const [initialCapital, setInitialCapital] = useState(saved?.initialCapital ?? '1000000')
+  const [benchmarkSymbol, setBenchmarkSymbol] = useState(saved?.benchmarkSymbol ?? '000300.SH')
   const [positionSizing, setPositionSizing] = useState<'equal' | 'score_weight'>(saved?.positionSizing ?? 'equal')
   const [simMode, setSimMode] = useState<'position' | 'full'>(saved?.mode ?? 'position')
   const [holdingDays, setHoldingDays] = useState(saved?.holdingDays ?? '5')
@@ -880,6 +939,7 @@ export function StrategyBacktest() {
   // 跨会话/拉新代码后自动渲染一个可能对应已失效策略的旧结果会造成困惑
   // (切页不卸载组件,内存中的 result 仍保留,无需靠 localStorage 恢复)。
   const [result, setResult] = useState<StrategyBacktestResult | null>(null)
+  const [activeSnapshot, setActiveSnapshot] = useState<Record<string, any> | null>(null)
   const [resultTab, setResultTab] = useState<'daily' | 'trades' | 'picks'>('daily')
   const [dailyPage, setDailyPage] = useState(0)
   const [tradePage, setTradePage] = useState(0)
@@ -916,6 +976,7 @@ export function StrategyBacktest() {
     queryFn: () => api.strategyGet(selectedStrategy!),
     enabled: !!selectedStrategy,
   })
+  const detail = strategyDetail.data
 
   const backtestTask = useBacktestTask()
   const isPending = backtestTask?.isPending ?? false
@@ -974,6 +1035,7 @@ export function StrategyBacktest() {
         maxPositions,
         maxExposure,
         initialCapital,
+        benchmarkSymbol,
         positionSizing,
         mode: simMode,
         holdingDays,
@@ -985,11 +1047,53 @@ export function StrategyBacktest() {
     }
   }, [backtestTask])
 
+  const strategyParamErrors = useMemo(
+    () => detail ? validateStrategyParamValues(detail.params, strategyParams) : [],
+    [detail, strategyParams],
+  )
+  const executionErrors = useMemo(() => {
+    const errors: string[] = []
+    const capital = Number(initialCapital)
+    const positions = Number(maxPositions)
+    const exposure = Number(maxExposure)
+    if (!Number.isFinite(capital) || capital < 10_000 || capital > 1_000_000_000) {
+      errors.push('初始资金必须在 1 万至 10 亿之间')
+    }
+    if (!Number.isInteger(positions) || positions < 1 || positions > 100) {
+      errors.push('最大持仓数必须是 1 至 100 的整数')
+    }
+    if (!Number.isFinite(exposure) || exposure < 1 || exposure > 100) {
+      errors.push('最大总仓位必须在 1% 至 100% 之间')
+    }
+    for (const [label, value] of [['佣金', fees], ['印花税', stampTax], ['滑点', slippage]] as const) {
+      const numeric = Number(value)
+      if (!Number.isFinite(numeric) || numeric < 0) errors.push(`${label}不能为负数或空值`)
+    }
+    if (start && end && start > end) errors.push('回测结束日期不能早于开始日期')
+    if (!benchmarkSymbol.trim()) errors.push('基准指数不能为空')
+    return errors
+  }, [benchmarkSymbol, end, fees, initialCapital, maxExposure, maxPositions, slippage, stampTax, start])
+  const validationErrors = [...strategyParamErrors, ...executionErrors]
+
   const handleRun = () => {
-    if (!selectedStrategy || backtestDataUnavailable) return
+    if (!selectedStrategy || backtestDataUnavailable || validationErrors.length > 0) return
     const requestOverrides = detail
       ? normalizeStrategyOverrides(detail, overrides)
       : overrides
+    setActiveSnapshot(JSON.parse(JSON.stringify({
+      strategy_id: selectedStrategy,
+      start,
+      end,
+      params: strategyParams,
+      overrides: requestOverrides,
+      initial_capital: Number(initialCapital),
+      max_positions: Number(maxPositions),
+      max_exposure_pct: Number(maxExposure) / 100,
+      commission_pct: Number(fees) / 10000,
+      stamp_tax_pct: Number(stampTax) / 1000,
+      slippage_bps: Number(slippage),
+      benchmark_symbol: benchmarkSymbol,
+    })))
     startBacktest({
       strategy_id: selectedStrategy,
       asset_type: assetType,
@@ -1005,6 +1109,7 @@ export function StrategyBacktest() {
       max_positions: Number(maxPositions),
       max_exposure_pct: Number(maxExposure) / 100,
       initial_capital: Number(initialCapital),
+      benchmark_symbol: benchmarkSymbol,
       position_sizing: positionSizing,
       params: strategyParams,
       overrides: requestOverrides,
@@ -1153,8 +1258,14 @@ export function StrategyBacktest() {
     return names
   }, [result?.trades])
 
-  const detail = strategyDetail.data
   const matrixStrategy = detail?.execution_backend === 'matrix_native'
+  const groupedStrategyParams = useMemo(() => {
+    const params = detail?.params ?? []
+    return [
+      { id: 'strategy', label: '策略条件', params: params.filter(param => param.group !== 'risk') },
+      { id: 'risk', label: '退出与风控', params: params.filter(param => param.group === 'risk') },
+    ].filter(group => group.params.length > 0)
+  }, [detail])
   const visibleAdvancedTabs = useMemo(
     () => matrixStrategy
       ? ADVANCED_TABS.filter(tab => tab.id !== 'entry' && tab.id !== 'exit')
@@ -1269,6 +1380,17 @@ export function StrategyBacktest() {
   ]
     .map(([key, label]) => ({ key, label, value: Number(executionStats[key] ?? 0) }))
     .filter(item => item.value > 0)
+
+  const exportResult = () => {
+    if (!result) return
+    const blob = new Blob([JSON.stringify(result, null, 2)], { type: 'application/json;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = `${result.strategy_info?.id ?? result.config?.strategy_id ?? 'strategy'}-${result.run_id}.json`
+    anchor.click()
+    URL.revokeObjectURL(url)
+  }
 
   return (
     <div className="h-full min-h-0 overflow-hidden rounded-card border border-border bg-surface/80 grid grid-cols-1 xl:grid-cols-[18rem_minmax(0,1fr)]">
@@ -1543,7 +1665,7 @@ export function StrategyBacktest() {
         <div className="grid grid-cols-2 gap-2">
           <div>
             <label className="text-xs font-medium text-secondary block mb-1.5">初始资金</label>
-            <input type="number" value={initialCapital} onChange={e => setInitialCapital(e.target.value)}
+            <input type="number" min={10000} max={1000000000} step={10000} value={initialCapital} onChange={e => setInitialCapital(e.target.value)}
               className={INPUT_CLS} />
           </div>
           <div>
@@ -1555,13 +1677,22 @@ export function StrategyBacktest() {
           </div>
           <div>
             <label className="text-xs font-medium text-secondary block mb-1.5">最大持仓数</label>
-            <input type="number" value={maxPositions} onChange={e => setMaxPositions(e.target.value)}
+            <input type="number" min={1} max={100} step={1} value={maxPositions} onChange={e => setMaxPositions(e.target.value)}
               className={INPUT_CLS} />
           </div>
           <div>
             <label className="text-xs font-medium text-secondary block mb-1.5">最大总仓位(%)</label>
-            <input type="number" min={0} max={100} value={maxExposure} onChange={e => setMaxExposure(e.target.value)}
+            <input type="number" min={1} max={100} step={1} value={maxExposure} onChange={e => setMaxExposure(e.target.value)}
               className={INPUT_CLS} />
+          </div>
+          <div className="col-span-2">
+            <label className="text-xs font-medium text-secondary block mb-1.5">基准指数</label>
+            <select value={benchmarkSymbol} onChange={e => setBenchmarkSymbol(e.target.value)} className={INPUT_CLS}>
+              <option value="000300.SH">沪深 300</option>
+              <option value="000001.SH">上证指数</option>
+              <option value="399001.SZ">深证成指</option>
+              <option value="399006.SZ">创业板指</option>
+            </select>
           </div>
         </div>
         )}
@@ -1599,6 +1730,12 @@ export function StrategyBacktest() {
           </div>
         )}
 
+        {validationErrors.length > 0 && (
+          <div className="rounded-btn border border-danger/30 bg-danger/10 px-3 py-2 text-[11px] leading-4 text-danger">
+            {validationErrors.slice(0, 3).map(error => <div key={error}>{error}</div>)}
+          </div>
+        )}
+
         {isPending ? (
           <button
             onClick={stopBacktest}
@@ -1612,7 +1749,7 @@ export function StrategyBacktest() {
         ) : (
           <button
             onClick={handleRun}
-            disabled={!selectedStrategy || strategyDetail.isLoading || backtestDataUnavailable}
+            disabled={!selectedStrategy || strategyDetail.isLoading || backtestDataUnavailable || validationErrors.length > 0}
             className="group w-full inline-flex items-center justify-center gap-2.5 rounded-btn border border-accent/40
               bg-gradient-to-r from-accent to-blue-500 px-3 py-2.5 text-white shadow-[0_10px_24px_rgba(59,130,246,0.22)]
               transition-all duration-150 ease-smooth hover:-translate-y-0.5 hover:shadow-[0_14px_28px_rgba(59,130,246,0.28)]
@@ -1722,6 +1859,9 @@ export function StrategyBacktest() {
                     ? '正在尝试恢复连接，若持续失败可停止后重试'
                     : result ? '当前展示上次结果，完成后自动替换' : '正在加载回测数据…'}
                 </div>
+                {activeSnapshot && (
+                  <div className="mt-0.5 text-[10px] text-muted">本次参数快照已锁定</div>
+                )}
               </div>
               {backtestTask?.progress && (
                 <span className="ml-auto shrink-0 font-mono text-sm font-semibold text-accent">
@@ -1746,6 +1886,40 @@ export function StrategyBacktest() {
               </div>
             )}
           </motion.div>
+        )}
+
+        {result && !result.error && (
+          <div className="border-y border-border bg-surface/55 px-3 py-2.5">
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-medium text-foreground">回测快照</span>
+              <span className="text-[10px] text-muted">参数与数据质量</span>
+              <button
+                type="button"
+                onClick={exportResult}
+                title="导出完整回测结果"
+                aria-label="导出完整回测结果"
+                className="ml-auto inline-flex h-7 w-7 items-center justify-center rounded-btn border border-border text-secondary transition-colors hover:border-accent/40 hover:text-accent"
+              >
+                <Download className="h-3.5 w-3.5" />
+              </button>
+            </div>
+            <div className="mt-2 grid gap-2 md:grid-cols-2">
+              <details className="text-[11px] text-secondary">
+                <summary className="cursor-pointer font-medium text-foreground">最终生效参数</summary>
+                <pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap break-all rounded-input bg-base/70 p-2 font-mono text-[10px] leading-4">{JSON.stringify(result.config, null, 2)}</pre>
+              </details>
+              <details className="text-[11px] text-secondary">
+                <summary className="cursor-pointer font-medium text-foreground">数据覆盖报告</summary>
+                <pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap break-all rounded-input bg-base/70 p-2 font-mono text-[10px] leading-4">{JSON.stringify(result.stats?.data_quality ?? {}, null, 2)}</pre>
+              </details>
+            </div>
+            {result.stats?.data_quality?.survivorship_bias_warning && (
+              <div className="mt-2 flex items-start gap-1.5 text-[10px] leading-4 text-warning">
+                <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+                <span>{String(result.stats.data_quality.survivorship_bias_warning)}</span>
+              </div>
+            )}
+          </div>
         )}
 
         {/* 旧全量模拟结果: 固定前瞻收益统计 (兼容历史缓存结果) */}
@@ -1783,7 +1957,7 @@ export function StrategyBacktest() {
               <span>日均候选 <b className="text-foreground num">{result.stats.avg_daily_candidates ?? 0}</b></span>
               <span>最佳 <b className="text-bull num">{fmtPct(result.stats.best)}</b></span>
               <span>最差 <b className="text-bear num">{fmtPct(result.stats.worst)}</b></span>
-              <span>基准(上证) <b className="text-foreground num">{fmtPct(result.stats.benchmark_return)}</b></span>
+              <span>基准 <b className="text-foreground num">{fmtPct(result.stats.benchmark_return)}</b></span>
             </div>
 
             {/* 累计超额曲线 (复用 StrategyNavChart) */}
@@ -2269,16 +2443,24 @@ export function StrategyBacktest() {
               )}
 
               {settingsTab === 'params' && (
-                <ConfigSection title="策略参数" hint="自动限制 min/max">
+                <ConfigSection title="策略参数" hint="百分比按 UI 显示，API 保存小数">
                   {detail.params.length > 0 ? (
-                    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                      {detail.params.map(param => (
-                        <StrategyParamInput
-                          key={param.id}
-                          param={param}
-                          value={strategyParams[param.id]}
-                          onChange={value => setStrategyParams(prev => ({ ...prev, [param.id]: value }))}
-                        />
+                    <div className="space-y-5">
+                      {groupedStrategyParams.map(group => (
+                        <div key={group.id}>
+                          <div className="mb-2 border-b border-border pb-1.5 text-xs font-semibold text-foreground">{group.label}</div>
+                          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                            {group.params.map(param => (
+                              <StrategyParamInput
+                                key={param.id}
+                                param={param}
+                                value={strategyParams[param.id]}
+                                disabled={param.depends_on ? strategyParams[param.depends_on] === false : false}
+                                onChange={value => setStrategyParams(prev => ({ ...prev, [param.id]: value }))}
+                              />
+                            ))}
+                          </div>
+                        </div>
                       ))}
                     </div>
                   ) : (

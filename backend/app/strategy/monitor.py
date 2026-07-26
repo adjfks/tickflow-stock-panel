@@ -740,10 +740,17 @@ class MonitorRuleEngine:
         # 现接入 history_loader, 拼历史窗口 + 今日实时行情, 经 precomputed_history 喂给引擎。
         # loader 为 None (未装配) 时退回跳过, 保持旧行为, 不破坏无历史场景。
         from app.strategy.engine import StrategyDataContext
+        evaluation_day = cn_today()
+        if "date" in df.columns and not df.is_empty():
+            latest_date = df["date"].max()
+            if isinstance(latest_date, _dt.datetime):
+                evaluation_day = latest_date.date()
+            elif isinstance(latest_date, _dt.date):
+                evaluation_day = latest_date
         current_context = StrategyDataContext(
             asset_type=at,
             timeframe="1d",
-            as_of=cn_today(),
+            as_of=evaluation_day,
             current=df,
         )
         if getattr(s, "execution_backend", "polars_expr") == "matrix_native":
@@ -754,7 +761,7 @@ class MonitorRuleEngine:
             current_context = StrategyDataContext(
                 asset_type=at,
                 timeframe="1d",
-                as_of=cn_today(),
+                as_of=evaluation_day,
                 current=df,
                 market=matrix,
             )
@@ -765,7 +772,7 @@ class MonitorRuleEngine:
                              sid, rule.get("asset_type", "stock"))
                 return []
             try:
-                today = cn_today()
+                today = evaluation_day
                 lookback = max(1, getattr(s, "lookback_days", 30))
                 hist_df = history_loader(today, lookback)
                 if hist_df is None or hist_df.is_empty():
@@ -813,7 +820,7 @@ class MonitorRuleEngine:
                 import math
                 self._building_strategy_results[sid] = {
                     "total": result.total,
-                    "as_of": str(cn_today()),
+                    "as_of": str(getattr(result, "as_of", evaluation_day)),
                     "rows": [
                         {k: (None if isinstance(v, float) and not math.isfinite(v) else v)
                          for k, v in row.items()}

@@ -147,11 +147,27 @@ def _sync_table(
     latest_only: bool = True,
 ) -> int:
     """同步单张财务表。返回写入的行数。"""
-    return _write_table(
-        table,
-        _fetch_table(table, symbols, capset, latest_only=latest_only),
-        data_dir,
+    fetched = _fetch_table(table, symbols, capset, latest_only=latest_only)
+    if not latest_only and table != "shares":
+        fetched = _merge_financial_history(get_financial_df(data_dir, table), fetched)
+    return _write_table(table, fetched, data_dir)
+
+
+def _merge_financial_history(*frames: pl.DataFrame) -> pl.DataFrame:
+    valid = [
+        frame
+        for frame in frames
+        if not frame.is_empty() and {"symbol", "period_end"} <= set(frame.columns)
+    ]
+    if not valid:
+        return pl.DataFrame()
+    merged = pl.concat(valid, how="diagonal_relaxed").filter(
+        pl.col("symbol").is_not_null() & pl.col("period_end").is_not_null()
     )
+    keys = ["symbol", "period_end"]
+    if "announce_date" in merged.columns:
+        keys.append("announce_date")
+    return merged.unique(subset=keys, keep="last").sort(keys)
 
 
 def _merge_share_history(*frames: pl.DataFrame) -> pl.DataFrame:
@@ -196,25 +212,25 @@ def _sync_shares_for_symbols(
 def sync_metrics(data_dir: Path, capset: CapabilitySet) -> int:
     """同步核心财务指标 (metrics)。"""
     symbols = _get_symbols(data_dir)
-    return _sync_table("metrics", symbols, data_dir, capset, latest_only=True)
+    return _sync_table("metrics", symbols, data_dir, capset, latest_only=False)
 
 
 def sync_income(data_dir: Path, capset: CapabilitySet) -> int:
     """同步利润表。"""
     symbols = _get_symbols(data_dir)
-    return _sync_table("income", symbols, data_dir, capset, latest_only=True)
+    return _sync_table("income", symbols, data_dir, capset, latest_only=False)
 
 
 def sync_balance_sheet(data_dir: Path, capset: CapabilitySet) -> int:
     """同步资产负债表。"""
     symbols = _get_symbols(data_dir)
-    return _sync_table("balance_sheet", symbols, data_dir, capset, latest_only=True)
+    return _sync_table("balance_sheet", symbols, data_dir, capset, latest_only=False)
 
 
 def sync_cash_flow(data_dir: Path, capset: CapabilitySet) -> int:
     """同步现金流量表。"""
     symbols = _get_symbols(data_dir)
-    return _sync_table("cash_flow", symbols, data_dir, capset, latest_only=True)
+    return _sync_table("cash_flow", symbols, data_dir, capset, latest_only=False)
 
 
 def sync_shares(data_dir: Path, capset: CapabilitySet) -> int:
@@ -235,7 +251,7 @@ def sync_all(data_dir: Path, capset: CapabilitySet) -> dict[str, int]:
         results[table] = (
             _sync_shares_for_symbols(symbols, data_dir, capset)
             if table == "shares"
-            else _sync_table(table, symbols, data_dir, capset, latest_only=True)
+            else _sync_table(table, symbols, data_dir, capset, latest_only=False)
         )
 
     # 同步完成后注册 DuckDB 视图
@@ -431,7 +447,7 @@ class FinancialScheduler:
             result[t] = (
                 _sync_shares_for_symbols(symbols, self._data_dir, self._capset)
                 if t == "shares"
-                else _sync_table(t, symbols, self._data_dir, self._capset, latest_only=True)
+                else _sync_table(t, symbols, self._data_dir, self._capset, latest_only=False)
             )
             self._record_sync(t)
         _refresh_financials_views(self._data_dir)

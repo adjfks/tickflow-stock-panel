@@ -69,7 +69,11 @@ export function useParamSweep(strategies: StrategyDetail[], onStrategyChange?: (
   const [sweeps, setSweeps] = useState<Record<string, Sweep>>({})
 
   const selected = strategies.find(s => s.id === strategyId)
-  const params = selected?.params ?? []
+  const allParams = selected?.params ?? []
+  const hasOptimizationContract = allParams.some(p => p.optimizable != null)
+  const params = hasOptimizationContract
+    ? allParams.filter(p => p.optimizable === true && (p.type === 'float' || p.type === 'int'))
+    : allParams
 
   const selectStrategy = (id: string) => {
     setStrategyId(id)

@@ -10,8 +10,9 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
+from types import MappingProxyType
 from typing import Literal
 
 import numpy as np
@@ -30,6 +31,215 @@ from app.parquet import scan_enriched_parquet
 from app.tickflow.repository import KlineRepository
 
 logger = logging.getLogger(__name__)
+
+PIT_FINANCIAL_FIELDS = frozenset({
+    "revenue_yoy",
+    "net_income_yoy",
+    "roe",
+    "debt_to_asset_ratio",
+})
+
+
+def _date_value(value) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, date):
+        return value
+    text = str(value).strip()[:10]
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        compact = "".join(character for character in text if character.isdigit())
+        if len(compact) != 8:
+            return None
+        try:
+            return date(int(compact[:4]), int(compact[4:6]), int(compact[6:8]))
+        except ValueError:
+            return None
+
+
+def _with_listing_day(instruments: pl.DataFrame | None) -> pl.DataFrame | None:
+    if instruments is None or instruments.is_empty() or "listing_day" in instruments.columns:
+        return instruments
+    source = "list_date" if "list_date" in instruments.columns else (
+        "listing_date" if "listing_date" in instruments.columns else None
+    )
+    if source is None:
+        return instruments
+    epoch = date(1970, 1, 1)
+    values = [
+        float((parsed - epoch).days) if (parsed := _date_value(value)) is not None else None
+        for value in instruments[source].to_list()
+    ]
+    return instruments.with_columns(pl.Series("listing_day", values, dtype=pl.Float32))
+
+
+def _attach_technical_data_quality(
+    market: MarketDataMatrix | MarketMatrix,
+    *,
+    min_coverage: float = 0.95,
+) -> MarketDataMatrix | MarketMatrix:
+    """Audit the execution matrix and reject incomplete observed OHLCV rows."""
+    core = {
+        "open": market.open,
+        "high": market.high,
+        "low": market.low,
+        "close": market.close,
+        "volume": market.volume,
+    }
+    observed = np.zeros(market.shape, dtype=bool)
+    for values in core.values():
+        observed |= np.isfinite(values)
+    observed_rows = int(observed.sum())
+    if observed_rows == 0:
+        raise ValueError("技术数据预检失败: 指定区间没有有效 OHLCV 行")
+
+    field_coverage = {
+        name: float((np.isfinite(values) & observed).sum()) / observed_rows
+        for name, values in core.items()
+    }
+    technical_coverage = min(field_coverage.values())
+    if technical_coverage < min_coverage:
+        details = ", ".join(
+            f"{name}={coverage:.1%}" for name, coverage in field_coverage.items()
+        )
+        raise ValueError(
+            f"技术数据覆盖率不足 {min_coverage:.0%}: {details}"
+        )
+
+    quality = dict(market.data_quality)
+    quality.update({
+        "date_start": market.timestamp_labels[0][:10],
+        "date_end": market.timestamp_labels[-1][:10],
+        "trading_days": len(market.timestamp_labels),
+        "symbol_count": len(market.symbols),
+        "observed_rows": observed_rows,
+        "grid_rows": int(np.prod(market.shape, dtype=np.int64)),
+        "grid_coverage": observed_rows / max(int(np.prod(market.shape)), 1),
+        "technical_field_coverage": field_coverage,
+        "technical_coverage": technical_coverage,
+        "technical_coverage_threshold": min_coverage,
+        "duplicate_key_count": 0,
+    })
+
+    if isinstance(market, MarketDataMatrix):
+        listing_day = market.fields.get("listing_day")
+        if listing_day is not None:
+            listing_values = listing_day[0] if listing_day.ndim == 2 else listing_day
+            quality["listing_date_coverage"] = float(np.isfinite(listing_values).mean())
+        raw_close = market.fields.get("raw_close")
+        if raw_close is not None:
+            raw_values = (
+                np.broadcast_to(raw_close.reshape(1, -1), market.shape)
+                if raw_close.ndim == 1 else raw_close
+            )
+            close_rows = np.isfinite(market.close)
+            quality["adjustment_reference_coverage"] = float(
+                (np.isfinite(raw_values) & close_rows).sum()
+            ) / max(int(close_rows.sum()), 1)
+            changed = np.isfinite(raw_values) & close_rows & (
+                np.abs(raw_values - market.close) > 1e-6
+            )
+            quality["adjusted_price_rows"] = int(changed.sum())
+
+    return replace(market, data_quality=MappingProxyType(quality))
+
+
+def _attach_pit_financial_fields(
+    market: MarketDataMatrix,
+    financials: pl.DataFrame,
+    required_fields: set[str],
+    *,
+    min_coverage: float = 0.80,
+) -> MarketDataMatrix:
+    required = sorted(set(required_fields) & set(PIT_FINANCIAL_FIELDS))
+    if not required:
+        return market
+    required_columns = {"symbol", "period_end", "announce_date", *required}
+    missing = required_columns - set(financials.columns)
+    if missing:
+        raise ValueError(f"历史财务字段缺失: {sorted(missing)}")
+
+    symbol_set = set(market.symbols)
+    rows_by_symbol: dict[str, list[tuple[int, int, dict]]] = {}
+    relevant_rows = 0
+    missing_announce_rows = 0
+    epoch = date(1970, 1, 1)
+    for row in financials.iter_rows(named=True):
+        symbol = str(row.get("symbol") or "")
+        if symbol not in symbol_set:
+            continue
+        relevant_rows += 1
+        announce = _date_value(row.get("announce_date"))
+        period_end = _date_value(row.get("period_end"))
+        if announce is None:
+            missing_announce_rows += 1
+            continue
+        if period_end is None:
+            continue
+        rows_by_symbol.setdefault(symbol, []).append((
+            (announce - epoch).days,
+            (period_end - epoch).days,
+            row,
+        ))
+    if relevant_rows == 0:
+        raise ValueError("历史财务数据未覆盖当前股票池")
+    if missing_announce_rows:
+        raise ValueError(
+            f"历史财务数据不合格: {missing_announce_rows} 条记录缺少 announce_date"
+        )
+
+    trading_days = (market.timestamps // 86_400_000).astype(np.int64)
+    fields = dict(market.fields)
+    for name in required:
+        fields[name] = np.full(market.shape, np.nan, dtype=np.float32)
+
+    for asset_id, symbol in enumerate(market.symbols):
+        records = sorted(rows_by_symbol.get(symbol, ()), key=lambda item: (item[0], item[1]))
+        if not records:
+            continue
+        announce_days = np.asarray([record[0] for record in records], dtype=np.int64)
+        active = np.searchsorted(announce_days, trading_days, side="left") - 1
+        valid_times = np.flatnonzero(active >= 0)
+        for time_id in valid_times:
+            row = records[int(active[time_id])][2]
+            for name in required:
+                value = row.get(name)
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(numeric):
+                    fields[name][time_id, asset_id] = np.float32(numeric)
+
+    valid_market = np.isfinite(market.close)
+    denominator = max(int(valid_market.sum()), 1)
+    coverage = {
+        name: float((np.isfinite(fields[name]) & valid_market).sum()) / denominator
+        for name in required
+    }
+    minimum = min(coverage.values(), default=0.0)
+    if minimum < min_coverage:
+        details = ", ".join(f"{name}={ratio:.1%}" for name, ratio in coverage.items())
+        raise ValueError(
+            f"历史财务覆盖率不足 {min_coverage:.0%}: {details}"
+        )
+    for name in required:
+        fields[name].flags.writeable = False
+    quality = dict(market.data_quality)
+    quality.update({
+        "financial_coverage": coverage,
+        "financial_announce_coverage": 1.0,
+        "financial_point_in_time": True,
+        "survivorship_bias_warning": "股票主数据不是历史成分股快照，结果可能存在幸存者偏差",
+    })
+    return replace(
+        market,
+        fields=MappingProxyType(fields),
+        data_quality=MappingProxyType(quality),
+    )
 
 
 def _matrix_entry_score(matrix: MarketMatrix, time_id: int, asset_id: int) -> float:
@@ -71,6 +281,12 @@ class MatcherConfig:
     # 分钟K精确成交: 开启后, 信号触发日的成交价用当日分钟K优化
     # (有参考线→穿越价, 无参考线→VWAP)。数据缺失时降级为日K口径。
     minute_fill: bool = False
+    dynamic_ma_stop: bool = False
+    initial_ma20_buffer_pct: float | None = None
+    profit_activation_1_pct: float | None = None
+    profit_activation_2_pct: float | None = None
+    trailing_ma10_buffer_pct: float | None = None
+    trailing_ma5_buffer_pct: float | None = None
 
     def __post_init__(self) -> None:
         # 解析最终口径: 优先 entry_fill/exit_fill, 否则回退到 matching (向后兼容)。
@@ -119,6 +335,7 @@ class TradeRecord:
     # 仅当该腿由信号触发时填充, 止损/止盈/到期等非信号退出时 exit_signal_id 为 None。
     entry_signal_id: str | None = None
     exit_signal_id: str | None = None
+    exit_legs: list[dict] | None = None
 
 
 @dataclass
@@ -409,12 +626,14 @@ class BacktestEngine:
         from app.tickflow.repository import enriched_dirname
 
         parquet_root = self.repo.store.data_dir / enriched_dirname(asset_type)
-        instruments = self.repo.get_instruments_asset(asset_type)
+        instruments = _with_listing_day(self.repo.get_instruments_asset(asset_type))
         field_columns = (
             set(feature_plan.base_columns)
             | set(feature_plan.instrument_columns)
             | set(feature_plan.matrix_columns)
         )
+        financial_fields = field_columns & set(PIT_FINANCIAL_FIELDS)
+        market_field_columns = field_columns - financial_fields
         cache_root = (
             self.repo.store.data_dir / ".backtest_matrix_cache"
             if settings.backtest_matrix_disk_cache_enabled
@@ -423,8 +642,9 @@ class BacktestEngine:
         cache_fields = (
             cache_profile.field_columns
             if cache_profile is not None
-            else frozenset(field_columns)
+            else frozenset(market_field_columns)
         )
+        cache_fields = frozenset(set(cache_fields) - set(PIT_FINANCIAL_FIELDS))
         cache_max_bytes = (
             cache_profile.max_disk_bytes
             if cache_profile is not None
@@ -437,11 +657,11 @@ class BacktestEngine:
             else None
         )
         try:
-            return load_market_data_matrix_from_parquet(
+            market = load_market_data_matrix_from_parquet(
                 parquet_root,
                 start,
                 end,
-                field_columns=field_columns,
+                field_columns=market_field_columns,
                 symbols=symbols,
                 instruments=instruments,
                 cache_root=cache_root,
@@ -454,8 +674,42 @@ class BacktestEngine:
                 ),
                 source_generation=source_generation,
             )
+            market = _attach_technical_data_quality(market)
+            adjustment_dir = self.repo.store.data_dir / (
+                "adj_factor_etf" if asset_type == "etf" else "adj_factor"
+            )
+            quality = dict(market.data_quality)
+            adjustment_available = adjustment_dir.exists() and any(
+                adjustment_dir.rglob("*.parquet")
+            )
+            quality["adjustment_data_available"] = adjustment_available
+            if not adjustment_available:
+                quality["adjustment_warning"] = (
+                    "本地缺少复权因子，价格可能使用未复权口径"
+                )
+            market = replace(
+                market,
+                data_quality=MappingProxyType(quality),
+            )
+            if not financial_fields:
+                return market
+            financial_path = (
+                self.repo.store.data_dir / "financials" / "metrics" / "part.parquet"
+            )
+            if not financial_path.exists():
+                raise ValueError(
+                    "完整策略需要历史财务数据，请先同步 financials/metrics 完整历史"
+                )
+            financials = pl.read_parquet(financial_path)
+            return _attach_pit_financial_fields(
+                market,
+                financials,
+                financial_fields,
+            )
         except pa.ArrowException as exc:
             raise ValueError(f"direct market matrix parquet scan failed: {exc}") from exc
+        except pl.exceptions.PolarsError as exc:
+            raise ValueError(f"historical financial parquet read failed: {exc}") from exc
 
     def cache_stats(self) -> dict:
         """暴露 PanelCache 遥测快照 (扫盘耗时/次数/命中/复用), 供上层量化 IO 占比。"""
@@ -746,7 +1000,10 @@ class BacktestEngine:
             execution_stats[key] = execution_stats.get(key, 0) + 1
 
         def _valid_price(value) -> bool:
-            return bool(np.isfinite(value) and value > 0)
+            try:
+                return bool(np.isfinite(value) and value > 0)
+            except (TypeError, ValueError):
+                return False
 
         def _present(time_id: int, asset_id: int) -> bool:
             return bool(np.isfinite([
@@ -825,6 +1082,37 @@ class BacktestEngine:
             high_price = float(matrix.high[time_id, asset_id])
             peak_price = float(pos["max_high"])
             lines: list[tuple[float, str]] = []
+            if config.dynamic_ma_stop:
+                dynamic_stop = pos.get("dynamic_stop_price")
+                peak_return = peak_price / entry_price - 1.0
+                reference_time = max(time_id - 1, 0)
+                candidates: list[float] = []
+                if (
+                    config.profit_activation_1_pct is not None
+                    and peak_return >= abs(float(config.profit_activation_1_pct))
+                    and matrix.risk_ma10 is not None
+                ):
+                    ma10 = float(matrix.risk_ma10[reference_time, asset_id])
+                    if _valid_price(ma10):
+                        candidates.append(
+                            ma10 * (1 - abs(float(config.trailing_ma10_buffer_pct or 0.0)))
+                        )
+                if (
+                    config.profit_activation_2_pct is not None
+                    and peak_return >= abs(float(config.profit_activation_2_pct))
+                    and matrix.risk_ma5 is not None
+                ):
+                    ma5 = float(matrix.risk_ma5[reference_time, asset_id])
+                    if _valid_price(ma5):
+                        candidates.append(
+                            ma5 * (1 - abs(float(config.trailing_ma5_buffer_pct or 0.0)))
+                        )
+                if candidates:
+                    raised = max(candidates)
+                    dynamic_stop = raised if not _valid_price(dynamic_stop) else max(dynamic_stop, raised)
+                    pos["dynamic_stop_price"] = dynamic_stop
+                if _valid_price(dynamic_stop):
+                    lines.append((float(dynamic_stop), "dynamic_ma_stop"))
             if config.stop_loss_pct is not None:
                 lines.append((entry_price * (1 - abs(config.stop_loss_pct)), "stop_loss"))
             if config.trailing_stop_pct is not None:
@@ -856,11 +1144,13 @@ class BacktestEngine:
             reason: str,
             signal_date: str,
             override: float | None = None,
+            target_ratio: float = 0.0,
         ) -> bool:
             signal_id = (
                 _signal_id(int(matrix.exit_signal_code[time_id, asset_id]), matrix.exit_signal_ids)
                 if reason == "signal" else None
             )
+            resolved_signal_id = pos.get("pending_exit_signal_id") or signal_id
             minute_trigger = config.exit_fill == "signal_next_minute" and reason == "signal"
             if minute_trigger and override is None:
                 if pos.get("pending_exit_next_open"):
@@ -869,22 +1159,28 @@ class BacktestEngine:
                 else:
                     override = _minute_trigger_price(time_id, asset_id)
                     if override is None:
-                        if not pos.get("pending_exit_reason"):
+                        pending_target = pos.get("pending_exit_target_ratio")
+                        if pending_target is None or target_ratio < float(pending_target):
                             pos["pending_exit_reason"] = reason
                             pos["pending_exit_signal_date"] = signal_date
                             pos["pending_exit_signal_id"] = signal_id
+                            pos["pending_exit_target_ratio"] = target_ratio
                             pos["pending_exit_next_open"] = True
-                            _count("pending_exit")
+                            if pending_target is None:
+                                _count("pending_exit")
                         pos["blocked_exit_days"] += 1
                         _count("sell_minute_trigger_fallback")
                         return False
             ok, blocked = _can_sell(time_id, asset_id, override)
             if not ok:
-                if not pos.get("pending_exit_reason"):
+                pending_target = pos.get("pending_exit_target_ratio")
+                if pending_target is None or target_ratio < float(pending_target):
                     pos["pending_exit_reason"] = reason
                     pos["pending_exit_signal_date"] = signal_date
                     pos["pending_exit_signal_id"] = signal_id
-                    _count("pending_exit")
+                    pos["pending_exit_target_ratio"] = target_ratio
+                    if pending_target is None:
+                        _count("pending_exit")
                 if minute_trigger:
                     pos["pending_exit_next_open"] = True
                 pos["blocked_exit_days"] += 1
@@ -893,31 +1189,68 @@ class BacktestEngine:
             exit_price = float(override) if override is not None else _refill(
                 time_id, asset_id, "sell", float(exit_prices[time_id, asset_id])
             )
-            shares = 100.0
-            entry_value = shares * pos["entry_price"] * (1 + buy_cost_pct)
-            exit_value = shares * exit_price * (1 - sell_cost_pct)
-            pnl_amount = exit_value - entry_value
+            initial_shares = 100.0
+            target_ratio = min(max(float(target_ratio), 0.0), 1.0)
+            sold_shares = max(float(pos["shares"]) - initial_shares * target_ratio, 0.0)
+            if sold_shares <= 1e-9:
+                pos["pending_exit_reason"] = None
+                pos["pending_exit_signal_date"] = None
+                pos["pending_exit_signal_id"] = None
+                pos["pending_exit_target_ratio"] = None
+                pos["pending_exit_next_open"] = False
+                return False
+            gross_value = sold_shares * exit_price
+            fee = gross_value * sell_cost_pct
+            exit_value = gross_value - fee
+            pos["shares"] = max(float(pos["shares"]) - sold_shares, 0.0)
+            pos["realized_exit_value"] += exit_value
+            pos["exit_gross_value"] += gross_value
+            pos["sold_shares"] += sold_shares
+            remaining_ratio = pos["shares"] / initial_shares
+            pos["exit_legs"].append({
+                "date": matrix.timestamp_labels[time_id][:10],
+                "signal_date": signal_date,
+                "target_position_ratio": round(target_ratio, 6),
+                "sold_shares": round(sold_shares, 4),
+                "price": round(exit_price, 4),
+                "fee": round(fee, 2),
+                "reason": reason,
+                "signal_id": resolved_signal_id,
+                "remaining_position_ratio": round(remaining_ratio, 6),
+            })
+            pos["pending_exit_reason"] = None
+            pos["pending_exit_signal_date"] = None
+            pos["pending_exit_signal_id"] = None
+            pos["pending_exit_target_ratio"] = None
+            pos["pending_exit_next_open"] = False
+            if pos["shares"] > 1e-9:
+                return False
+            entry_value = initial_shares * pos["entry_price"] * (1 + buy_cost_pct)
+            total_exit_value = float(pos["realized_exit_value"])
+            weighted_exit_price = float(pos["exit_gross_value"]) / float(pos["sold_shares"])
+            pnl_amount = total_exit_value - entry_value
             trades.append(TradeRecord(
                 symbol=matrix.symbols[asset_id],
                 name=matrix.names[asset_id],
                 entry_date=pos["entry_date"],
                 exit_date=matrix.timestamp_labels[time_id][:10],
                 entry_price=round(float(pos["entry_price"]), 4),
-                exit_price=round(exit_price, 4),
+                exit_price=round(weighted_exit_price, 4),
                 pnl_pct=round(float(pnl_amount / entry_value), 6) if entry_value > 0 else 0.0,
                 duration=int(pos["hold_days"]),
                 exit_reason=reason,
-                shares=shares,
+                shares=initial_shares,
                 lots=1.0,
                 entry_value=round(float(entry_value), 2),
-                exit_value=round(float(exit_value), 2),
+                exit_value=round(total_exit_value, 2),
                 pnl_amount=round(float(pnl_amount), 2),
                 entry_score=round(float(pos["entry_score"]), 2),
                 entry_signal_date=pos["entry_signal_date"],
                 exit_signal_date=signal_date,
                 blocked_exit_days=int(pos["blocked_exit_days"]),
                 entry_signal_id=pos["entry_signal_id"],
-                exit_signal_id=(pos.get("pending_exit_signal_id") or signal_id) if reason == "signal" else None,
+                exit_signal_id=resolved_signal_id if reason == "signal" else None,
+                exit_legs=list(pos["exit_legs"]),
             ))
             return True
 
@@ -958,6 +1291,14 @@ class BacktestEngine:
                 continue
             entry_price = _refill(time_id, asset_id, "buy", float(entry_prices[time_id, asset_id]))
             entry_date = matrix.timestamp_labels[time_id][:10]
+            entry_signal_time = int(matrix.entry_signal_time[time_id, asset_id])
+            initial_dynamic_stop = None
+            if config.dynamic_ma_stop and matrix.risk_ma20 is not None and entry_signal_time >= 0:
+                entry_ma20 = float(matrix.risk_ma20[entry_signal_time, asset_id])
+                if _valid_price(entry_ma20):
+                    initial_dynamic_stop = entry_ma20 * (
+                        1 - abs(float(config.initial_ma20_buffer_pct or 0.0))
+                    )
             pos = {
                 "entry_time": time_id,
                 "entry_date": entry_date,
@@ -974,8 +1315,15 @@ class BacktestEngine:
                 "pending_exit_reason": None,
                 "pending_exit_signal_date": None,
                 "pending_exit_signal_id": None,
+                "pending_exit_target_ratio": None,
                 "pending_exit_next_open": False,
                 "blocked_exit_days": 0,
+                "dynamic_stop_price": initial_dynamic_stop,
+                "shares": 100.0,
+                "realized_exit_value": 0.0,
+                "exit_gross_value": 0.0,
+                "sold_shares": 0.0,
+                "exit_legs": [],
             }
             closed = False
             for future in future_times:
@@ -997,7 +1345,21 @@ class BacktestEngine:
                     reason = "max_hold"
                 elif future == future_times[-1]:
                     reason = "end"
-                if reason and _try_close(pos, future, asset_id, reason, signal_date):
+                target_ratio = 0.0
+                if pos.get("pending_exit_target_ratio") is not None:
+                    target_ratio = float(pos["pending_exit_target_ratio"])
+                elif reason == "signal" and matrix.target_position_ratio is not None:
+                    value = float(matrix.target_position_ratio[future, asset_id])
+                    if np.isfinite(value):
+                        target_ratio = value
+                if reason and _try_close(
+                    pos,
+                    future,
+                    asset_id,
+                    reason,
+                    signal_date,
+                    target_ratio=target_ratio,
+                ):
                     closed = True
                     break
                 high_price = float(matrix.high[future, asset_id])
@@ -1281,11 +1643,14 @@ class BacktestEngine:
             return None, None
 
         def _try_close(pos: dict, idx: int, reason: str, signal_date: str, exit_price_override: float | None = None) -> bool:
+            signal_id = _resolve_signal_id(panel, idx, exit_signal_ids) if reason == "signal" else None
+            resolved_signal_id = pos.get("pending_exit_signal_id") or signal_id
             ok, block_reason = _can_sell(idx, exit_price_override)
             if not ok:
                 if not pos.get("pending_exit_reason"):
                     pos["pending_exit_reason"] = reason
                     pos["pending_exit_signal_date"] = signal_date
+                    pos["pending_exit_signal_id"] = signal_id
                     _count("pending_exit")
                 pos["blocked_exit_days"] = int(pos.get("blocked_exit_days", 0)) + 1
                 _count(block_reason)
@@ -1298,6 +1663,7 @@ class BacktestEngine:
             shares = 100.0
             entry_value = shares * float(pos["entry_price"]) * (1 + buy_cost_pct)
             exit_value = shares * exit_price * (1 - sell_cost_pct)
+            fee = shares * exit_price * sell_cost_pct
             pnl_amount = exit_value - entry_value
             pnl_pct = pnl_amount / entry_value if entry_value > 0 else 0.0
             trades.append(TradeRecord(
@@ -1321,7 +1687,18 @@ class BacktestEngine:
                 exit_signal_date=signal_date,
                 blocked_exit_days=int(pos.get("blocked_exit_days", 0)),
                 entry_signal_id=pos.get("entry_signal_id"),
-                exit_signal_id=_resolve_signal_id(panel, idx, exit_signal_ids) if reason == "signal" else None,
+                exit_signal_id=resolved_signal_id if reason == "signal" else None,
+                exit_legs=[{
+                    "date": self._date_str(panel_dates[idx]),
+                    "signal_date": signal_date,
+                    "target_position_ratio": 0.0,
+                    "sold_shares": shares,
+                    "price": round(exit_price, 4),
+                    "fee": round(fee, 2),
+                    "reason": reason,
+                    "signal_id": resolved_signal_id,
+                    "remaining_position_ratio": 0.0,
+                }],
             ))
             return True
 
@@ -1387,25 +1764,26 @@ class BacktestEngine:
                 pos["hold_days"] = int(pos["hold_days"]) + 1
                 d_str = self._date_str(panel_dates[idx])
 
-                def _scheduled_reason() -> tuple[str | None, str]:
-                    if pos.get("pending_exit_reason"):
-                        return str(pos["pending_exit_reason"]), str(pos.get("pending_exit_signal_date") or d_str)
-                    # 卖点信号优先于到期: 策略主动离场先于 max_hold 兜底。
-                    if ext[idx]:
-                        return "signal", str(exit_signal_dates[idx] or d_str)
-                    if config.max_hold_days is not None and pos["hold_days"] >= config.max_hold_days:
-                        return "max_hold", d_str
-                    if idx == rows[-1]:
-                        return "end", d_str
-                    return None, d_str
-
                 # 统一退出顺序: 风控(止损/移动止损/止盈)先于计划出场 (signal/max_hold/end)。
                 # 无论 entry/exit 口径如何, 风控都是保护性离场, 必须最高优先级。
                 reason, override_price = _risk_exit(pos, idx)
                 if reason and _try_close(pos, idx, reason, d_str, override_price):
                     closed = True
                     break
-                reason, signal_date = _scheduled_reason()
+                signal_date = d_str
+                if pos.get("pending_exit_reason"):
+                    reason = str(pos["pending_exit_reason"])
+                    signal_date = str(pos.get("pending_exit_signal_date") or d_str)
+                elif ext[idx]:
+                    # 卖点信号优先于到期: 策略主动离场先于 max_hold 兜底。
+                    reason = "signal"
+                    signal_date = str(exit_signal_dates[idx] or d_str)
+                elif config.max_hold_days is not None and pos["hold_days"] >= config.max_hold_days:
+                    reason = "max_hold"
+                elif idx == rows[-1]:
+                    reason = "end"
+                else:
+                    reason = None
                 if reason and _try_close(pos, idx, reason, signal_date):
                     closed = True
                     break
@@ -1664,7 +2042,10 @@ class BacktestEngine:
             execution_stats[key] = execution_stats.get(key, 0) + 1
 
         def _valid_price(value) -> bool:
-            return bool(np.isfinite(value) and value > 0)
+            try:
+                return bool(np.isfinite(value) and value > 0)
+            except (TypeError, ValueError):
+                return False
 
         def _signal_id(code: int, signal_ids: tuple[str, ...]) -> str | None:
             return signal_ids[code] if 0 <= code < len(signal_ids) else None
@@ -1749,13 +2130,17 @@ class BacktestEngine:
             signal_date: str,
             signal_id: str | None = None,
             next_open: bool = False,
+            target_ratio: float = 0.0,
         ) -> None:
             pos = positions[asset_id]
-            if not pos.get("pending_exit_reason"):
+            pending_target = pos.get("pending_exit_target_ratio")
+            if pending_target is None or target_ratio < float(pending_target):
                 pos["pending_exit_reason"] = reason
                 pos["pending_exit_signal_date"] = signal_date
                 pos["pending_exit_signal_id"] = signal_id
-                _count("pending_exit")
+                pos["pending_exit_target_ratio"] = target_ratio
+                if pending_target is None:
+                    _count("pending_exit")
             if next_open:
                 pos["pending_exit_next_open"] = True
             pos["blocked_exit_days"] += 1
@@ -1767,15 +2152,63 @@ class BacktestEngine:
             signal_date: str,
             sold_today: set[int],
             override: float | None = None,
+            target_ratio: float = 0.0,
+            signal_id: str | None = None,
         ) -> None:
             nonlocal cash
-            pos = positions.pop(asset_id)
+            pos = positions[asset_id]
+            resolved_signal_id = pos.get("pending_exit_signal_id") or signal_id
             exit_price = float(override) if override is not None else _refill_price(
                 time_id, asset_id, "sell", float(exit_prices[time_id, asset_id])
             )
-            exit_value = pos["shares"] * exit_price * (1 - sell_cost_pct)
+            initial_shares = float(pos["initial_shares"])
+            target_ratio = min(max(float(target_ratio), 0.0), 1.0)
+            desired_shares = initial_shares * target_ratio
+            sold_shares = max(float(pos["shares"]) - desired_shares, 0.0)
+            if sold_shares <= max(initial_shares * 1e-9, 1e-9):
+                pos["pending_exit_reason"] = None
+                pos["pending_exit_signal_date"] = None
+                pos["pending_exit_signal_id"] = None
+                pos["pending_exit_target_ratio"] = None
+                pos["pending_exit_next_open"] = False
+                return
+            gross_value = sold_shares * exit_price
+            fee = gross_value * sell_cost_pct
+            exit_value = gross_value - fee
             cash += exit_value
-            pnl_amount = exit_value - pos["entry_value"]
+            pos["shares"] = max(float(pos["shares"]) - sold_shares, 0.0)
+            pos["lots"] = pos["shares"] / 100.0
+            pos["realized_exit_value"] += exit_value
+            pos["exit_gross_value"] += gross_value
+            pos["sold_shares"] += sold_shares
+            remaining_ratio = pos["shares"] / initial_shares if initial_shares > 0 else 0.0
+            pos["exit_legs"].append({
+                "date": matrix.timestamp_labels[time_id][:10],
+                "signal_date": signal_date,
+                "target_position_ratio": round(target_ratio, 6),
+                "sold_shares": round(sold_shares, 4),
+                "price": round(exit_price, 4),
+                "fee": round(fee, 2),
+                "reason": reason,
+                "signal_id": resolved_signal_id,
+                "remaining_position_ratio": round(remaining_ratio, 6),
+            })
+            pos["pending_exit_reason"] = None
+            pos["pending_exit_signal_date"] = None
+            pos["pending_exit_signal_id"] = None
+            pos["pending_exit_target_ratio"] = None
+            pos["pending_exit_next_open"] = False
+            if pos["shares"] > max(initial_shares * 1e-9, 1e-9):
+                return
+
+            positions.pop(asset_id)
+            total_exit_value = float(pos["realized_exit_value"])
+            weighted_exit_price = (
+                float(pos["exit_gross_value"]) / float(pos["sold_shares"])
+                if pos["sold_shares"] > 0
+                else exit_price
+            )
+            pnl_amount = total_exit_value - pos["entry_value"]
             pnl_pct = pnl_amount / pos["entry_value"] if pos["entry_value"] > 0 else 0.0
             sold_today.add(asset_id)
             trades.append(TradeRecord(
@@ -1784,25 +2217,26 @@ class BacktestEngine:
                 entry_date=pos["entry_date"],
                 exit_date=matrix.timestamp_labels[time_id][:10],
                 entry_price=round(float(pos["entry_price"]), 4),
-                exit_price=round(exit_price, 4),
+                exit_price=round(weighted_exit_price, 4),
                 pnl_pct=round(float(pnl_pct), 6),
                 duration=int(pos["hold_days"]),
                 exit_reason=reason,
-                shares=round(float(pos["shares"]), 4),
-                lots=round(float(pos["lots"]), 2),
+                shares=round(initial_shares, 4),
+                lots=round(initial_shares / 100.0, 2),
                 position_pct=round(float(pos["position_pct"]), 6),
                 entry_value=round(float(pos["entry_value"]), 2),
-                exit_value=round(float(exit_value), 2),
+                exit_value=round(total_exit_value, 2),
                 pnl_amount=round(float(pnl_amount), 2),
                 entry_score=round(float(pos["entry_score"]), 2),
                 entry_signal_date=pos["entry_signal_date"],
                 exit_signal_date=signal_date,
                 blocked_exit_days=int(pos["blocked_exit_days"]),
                 entry_signal_id=pos["entry_signal_id"],
-                exit_signal_id=(
-                    pos.get("pending_exit_signal_id")
-                    or _signal_id(int(matrix.exit_signal_code[time_id, asset_id]), matrix.exit_signal_ids)
-                ) if reason == "signal" else None,
+                exit_signal_id=(resolved_signal_id or _signal_id(
+                    int(matrix.exit_signal_code[time_id, asset_id]),
+                    matrix.exit_signal_ids,
+                )) if reason == "signal" else None,
+                exit_legs=list(pos["exit_legs"]),
             ))
 
         def _try_sell(
@@ -1812,6 +2246,7 @@ class BacktestEngine:
             signal_date: str,
             sold_today: set[int],
             override: float | None = None,
+            target_ratio: float = 0.0,
         ) -> bool:
             signal_id = (
                 _signal_id(int(matrix.exit_signal_code[time_id, asset_id]), matrix.exit_signal_ids)
@@ -1825,7 +2260,14 @@ class BacktestEngine:
                 else:
                     override = _minute_trigger_price(time_id, asset_id)
                     if override is None:
-                        _mark_pending(asset_id, reason, signal_date, signal_id, next_open=True)
+                        _mark_pending(
+                            asset_id,
+                            reason,
+                            signal_date,
+                            signal_id,
+                            next_open=True,
+                            target_ratio=target_ratio,
+                        )
                         _count("sell_minute_trigger_fallback")
                         return False
             ok, blocked = _can_sell(time_id, asset_id, override)
@@ -1836,10 +2278,20 @@ class BacktestEngine:
                     signal_date,
                     signal_id,
                     next_open=minute_trigger,
+                    target_ratio=target_ratio,
                 )
                 _count(blocked)
                 return False
-            _sell(time_id, asset_id, reason, signal_date, sold_today, override)
+            _sell(
+                time_id,
+                asset_id,
+                reason,
+                signal_date,
+                sold_today,
+                override,
+                target_ratio,
+                signal_id,
+            )
             return True
 
         for time_id, date_label in enumerate(matrix.timestamp_labels):
@@ -1875,6 +2327,37 @@ class BacktestEngine:
                 entry_price = float(pos["entry_price"])
                 peak_price = float(pos["max_high"])
                 risk_lines: list[tuple[float, str]] = []
+                if config.dynamic_ma_stop:
+                    dynamic_stop = pos.get("dynamic_stop_price")
+                    peak_return = peak_price / entry_price - 1.0
+                    reference_time = max(time_id - 1, 0)
+                    candidates: list[float] = []
+                    if (
+                        config.profit_activation_1_pct is not None
+                        and peak_return >= abs(float(config.profit_activation_1_pct))
+                        and matrix.risk_ma10 is not None
+                    ):
+                        ma10 = float(matrix.risk_ma10[reference_time, asset_id])
+                        if _valid_price(ma10):
+                            candidates.append(
+                                ma10 * (1 - abs(float(config.trailing_ma10_buffer_pct or 0.0)))
+                            )
+                    if (
+                        config.profit_activation_2_pct is not None
+                        and peak_return >= abs(float(config.profit_activation_2_pct))
+                        and matrix.risk_ma5 is not None
+                    ):
+                        ma5 = float(matrix.risk_ma5[reference_time, asset_id])
+                        if _valid_price(ma5):
+                            candidates.append(
+                                ma5 * (1 - abs(float(config.trailing_ma5_buffer_pct or 0.0)))
+                            )
+                    if candidates:
+                        raised = max(candidates)
+                        dynamic_stop = raised if not _valid_price(dynamic_stop) else max(dynamic_stop, raised)
+                        pos["dynamic_stop_price"] = dynamic_stop
+                    if _valid_price(dynamic_stop):
+                        risk_lines.append((float(dynamic_stop), "dynamic_ma_stop"))
                 if config.stop_loss_pct is not None:
                     risk_lines.append((entry_price * (1 - abs(config.stop_loss_pct)), "stop_loss"))
                 if config.trailing_stop_pct is not None:
@@ -1919,7 +2402,21 @@ class BacktestEngine:
                 elif time_id == time_count - 1:
                     reason = "end"
                 if reason:
-                    _try_sell(time_id, asset_id, reason, signal_date, sold_today)
+                    target_ratio = 0.0
+                    if pos.get("pending_exit_target_ratio") is not None:
+                        target_ratio = float(pos["pending_exit_target_ratio"])
+                    elif reason == "signal" and matrix.target_position_ratio is not None:
+                        value = float(matrix.target_position_ratio[time_id, asset_id])
+                        if np.isfinite(value):
+                            target_ratio = value
+                    _try_sell(
+                        time_id,
+                        asset_id,
+                        reason,
+                        signal_date,
+                        sold_today,
+                        target_ratio=target_ratio,
+                    )
 
             if time_id < time_count - 1 and max_positions > 0:
                 candidates: list[tuple[int, float]] = []
@@ -1987,6 +2484,18 @@ class BacktestEngine:
                                 _count("buy_exposure")
                                 continue
                             cash -= entry_value
+                            entry_signal_time = int(matrix.entry_signal_time[time_id, asset_id])
+                            initial_dynamic_stop = None
+                            if (
+                                config.dynamic_ma_stop
+                                and matrix.risk_ma20 is not None
+                                and entry_signal_time >= 0
+                            ):
+                                entry_ma20 = float(matrix.risk_ma20[entry_signal_time, asset_id])
+                                if _valid_price(entry_ma20):
+                                    initial_dynamic_stop = entry_ma20 * (
+                                        1 - abs(float(config.initial_ma20_buffer_pct or 0.0))
+                                    )
                             positions[asset_id] = {
                                 "entry_date": date_text,
                                 "entry_signal_date": _signal_date(
@@ -1998,6 +2507,7 @@ class BacktestEngine:
                                 "entry_price": entry_price,
                                 "entry_value": entry_value,
                                 "shares": shares,
+                                "initial_shares": shares,
                                 "lots": shares / 100,
                                 "position_pct": entry_value / equity_before if equity_before > 0 else 0.0,
                                 "entry_score": entry_score,
@@ -2006,8 +2516,14 @@ class BacktestEngine:
                                 "pending_exit_reason": None,
                                 "pending_exit_signal_date": None,
                                 "pending_exit_signal_id": None,
+                                "pending_exit_target_ratio": None,
                                 "pending_exit_next_open": False,
                                 "blocked_exit_days": 0,
+                                "dynamic_stop_price": initial_dynamic_stop,
+                                "realized_exit_value": 0.0,
+                                "exit_gross_value": 0.0,
+                                "sold_shares": 0.0,
+                                "exit_legs": [],
                             }
 
             for asset_id, pos in positions.items():
@@ -2298,11 +2814,17 @@ class BacktestEngine:
                 return False, "sell_limit_down"
             return True, ""
 
-        def _mark_pending(sym: str, reason: str, signal_date: str) -> None:
+        def _mark_pending(
+            sym: str,
+            reason: str,
+            signal_date: str,
+            signal_id: str | None,
+        ) -> None:
             pos = positions[sym]
             if not pos.get("pending_exit_reason"):
                 pos["pending_exit_reason"] = reason
                 pos["pending_exit_signal_date"] = signal_date
+                pos["pending_exit_signal_id"] = signal_id
                 _count("pending_exit")
             pos["blocked_exit_days"] = int(pos.get("blocked_exit_days", 0)) + 1
 
@@ -2316,11 +2838,15 @@ class BacktestEngine:
         ) -> None:
             nonlocal cash
             pos = positions.pop(sym)
+            resolved_signal_id = pos.get("pending_exit_signal_id") or (
+                _resolve_signal_id(panel, idx, exit_signal_ids) if reason == "signal" else None
+            )
             if exit_price_override is not None:
                 exit_price = float(exit_price_override)
             else:
                 exit_price = _refill_price(idx, "sell", float(exit_prices[idx]))
             exit_value = pos["shares"] * exit_price * (1 - sell_cost_pct)
+            fee = pos["shares"] * exit_price * sell_cost_pct
             cash += exit_value
             pnl_amount = exit_value - pos["entry_value"]
             pnl_pct = (exit_value - pos["entry_value"]) / pos["entry_value"] if pos["entry_value"] > 0 else 0.0
@@ -2346,7 +2872,18 @@ class BacktestEngine:
                 exit_signal_date=signal_date,
                 blocked_exit_days=int(pos.get("blocked_exit_days", 0)),
                 entry_signal_id=pos.get("entry_signal_id"),
-                exit_signal_id=_resolve_signal_id(panel, idx, exit_signal_ids) if reason == "signal" else None,
+                exit_signal_id=resolved_signal_id if reason == "signal" else None,
+                exit_legs=[{
+                    "date": self._date_str(panel_dates[idx]),
+                    "signal_date": signal_date,
+                    "target_position_ratio": 0.0,
+                    "sold_shares": round(float(pos["shares"]), 4),
+                    "price": round(exit_price, 4),
+                    "fee": round(float(fee), 2),
+                    "reason": reason,
+                    "signal_id": resolved_signal_id,
+                    "remaining_position_ratio": 0.0,
+                }],
             ))
 
         def _try_sell(
@@ -2357,13 +2894,16 @@ class BacktestEngine:
             sold_today: set[str],
             exit_price_override: float | None = None,
         ) -> bool:
+            signal_id = None
+            if reason == "signal" and idx is not None:
+                signal_id = _resolve_signal_id(panel, idx, exit_signal_ids)
             if idx is None:
-                _mark_pending(sym, reason, signal_date)
+                _mark_pending(sym, reason, signal_date, signal_id)
                 _count("sell_suspended")
                 return False
             ok, block_reason = _can_sell(idx, exit_price_override)
             if not ok:
-                _mark_pending(sym, reason, signal_date)
+                _mark_pending(sym, reason, signal_date, signal_id)
                 _count(block_reason)
                 return False
             _sell(sym, idx, reason, signal_date, sold_today, exit_price_override)

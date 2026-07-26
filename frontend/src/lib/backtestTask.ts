@@ -174,6 +174,7 @@ export function startBacktest(params: {
   max_positions?: number
   max_exposure_pct?: number
   initial_capital?: number
+  benchmark_symbol?: string
   position_sizing?: string
   params?: Record<string, any> | null
   overrides?: Record<string, any> | null
@@ -207,6 +208,7 @@ export function startBacktest(params: {
     max_positions: params.max_positions,
     max_exposure_pct: params.max_exposure_pct,
     initial_capital: params.initial_capital,
+    benchmark_symbol: params.benchmark_symbol,
     position_sizing: params.position_sizing,
     params: params.params ? JSON.stringify(params.params) : undefined,
     overrides: params.overrides ? JSON.stringify(params.overrides) : undefined,

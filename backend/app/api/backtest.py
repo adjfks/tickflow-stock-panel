@@ -195,16 +195,17 @@ class StrategyBacktestRequest(BaseModel):
     matching: Literal["close_t", "open_t+1"] = "open_t+1"
     entry_fill: Literal["close_t", "open_t+1"] | None = None
     exit_fill: Literal["close_t", "open_t+1", "signal_next_minute"] | None = None
-    fees_pct: float = 0.0002
-    commission_pct: float | None = None
-    stamp_tax_pct: float | None = None
-    slippage_bps: float = 5.0
-    max_positions: int = 10
-    max_exposure_pct: float = 1.0
-    initial_capital: float = 1_000_000.0
+    fees_pct: float = Field(default=0.0003, ge=0)
+    commission_pct: float | None = Field(default=0.0003, ge=0)
+    stamp_tax_pct: float | None = Field(default=0.0005, ge=0)
+    slippage_bps: float = Field(default=5.0, ge=0)
+    max_positions: int = Field(default=10, ge=1, le=100)
+    max_exposure_pct: float = Field(default=1.0, ge=0.01, le=1.0)
+    initial_capital: float = Field(default=1_000_000.0, ge=10_000, le=1_000_000_000)
+    benchmark_symbol: str = Field(default="000300.SH", min_length=1)
     position_sizing: Literal["equal", "score_weight"] = "equal"
     mode: Literal["position", "full"] = "position"
-    holding_days: int = 5
+    holding_days: int = Field(default=5, ge=1)
     asset_type: str = "stock"
     minute_fill: bool = False
 
@@ -216,7 +217,7 @@ def strategy_run(req: StrategyBacktestRequest, request: Request):
     from app.backtest.worker import make_worker_task, run_worker_task
 
     end = req.end or date.today()
-    start = _resolve_start(req, end, FACTOR_DEFAULT_DAYS)
+    start = _resolve_start(req, end, STRATEGY_DEFAULT_DAYS)
     _guard_server_backtest_range(start, end)
 
     cfg = StrategyBacktestConfig(
@@ -236,6 +237,7 @@ def strategy_run(req: StrategyBacktestRequest, request: Request):
         max_positions=req.max_positions,
         max_exposure_pct=req.max_exposure_pct,
         initial_capital=req.initial_capital,
+        benchmark_symbol=req.benchmark_symbol,
         position_sizing=req.position_sizing,
         mode=req.mode,
         holding_days=req.holding_days,
@@ -315,8 +317,9 @@ def _make_job_key(
     commission_pct: float | None = None, stamp_tax_pct: float | None = None,
     asset_type: str = "stock",
     minute_fill: bool = False,
+    benchmark_symbol: str = "000300.SH",
 ) -> str:
-    raw = f"{strategy_id}|{symbols}|{start}|{end}|{matching}|{entry_fill}|{exit_fill}|{fees_pct}|{slippage_bps}|{max_positions}|{max_exposure_pct}|{initial_capital}|{position_sizing}|{params}|{overrides}|{mode}|{holding_days}|{commission_pct}|{stamp_tax_pct}|{asset_type}|{minute_fill}"
+    raw = f"{strategy_id}|{symbols}|{start}|{end}|{matching}|{entry_fill}|{exit_fill}|{fees_pct}|{slippage_bps}|{max_positions}|{max_exposure_pct}|{initial_capital}|{position_sizing}|{params}|{overrides}|{mode}|{holding_days}|{commission_pct}|{stamp_tax_pct}|{asset_type}|{minute_fill}|{benchmark_symbol}"
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
@@ -330,13 +333,14 @@ async def strategy_stream(
     matching: str = "open_t+1",
     entry_fill: str | None = None,
     exit_fill: str | None = None,
-    fees_pct: float = 0.0002,
-    commission_pct: float | None = None,
-    stamp_tax_pct: float | None = None,
+    fees_pct: float = 0.0003,
+    commission_pct: float | None = 0.0003,
+    stamp_tax_pct: float | None = 0.0005,
     slippage_bps: float = 5.0,
     max_positions: int = 10,
     max_exposure_pct: float = 1.0,
     initial_capital: float = 1_000_000.0,
+    benchmark_symbol: str = "000300.SH",
     position_sizing: str = "equal",
     params: str | None = None,
     overrides: str | None = None,
@@ -363,9 +367,7 @@ async def strategy_stream(
     if start:
         start_date = date.fromisoformat(start)
     else:
-        # 空 start = 全部历史: 用本地最早日K日期, 查不到再回退到默认窗口
-        earliest = request.app.state.repo.earliest_daily_date()
-        start_date = earliest or (end_date - timedelta(days=FACTOR_DEFAULT_DAYS))
+        start_date = end_date - timedelta(days=STRATEGY_DEFAULT_DAYS)
 
     # 服务端范围保护
     guard_violated = False
@@ -383,6 +385,7 @@ async def strategy_stream(
         commission_pct, stamp_tax_pct,
         asset_type=asset_type,
         minute_fill=minute_fill,
+        benchmark_symbol=benchmark_symbol,
     )
 
     _cleanup_stale_jobs()
@@ -438,6 +441,7 @@ async def strategy_stream(
                 max_positions=int(max_positions),
                 max_exposure_pct=float(max_exposure_pct),
                 initial_capital=float(initial_capital),
+                benchmark_symbol=benchmark_symbol,
                 position_sizing=position_sizing,
                 mode=mode,
                 holding_days=int(holding_days),
@@ -517,9 +521,9 @@ async def strategy_cancel(request: Request):
     p = parse_qs(qs)
     def _get(key: str, default: str = "") -> str:
         return p.get(key, [default])[0]
-    def _get_opt_float(key: str) -> float | None:
+    def _get_opt_float(key: str, default: str = "") -> float | None:
         # 可选成本参数: 缺省或空串 → None (与 stream 侧 float | None 口径一致, 保证 job_key 对齐)。
-        v = _get(key)
+        v = _get(key, default)
         return float(v) if v else None
     job_key = _make_job_key(
         _get("strategy_id"),
@@ -529,7 +533,7 @@ async def strategy_cancel(request: Request):
         _get("matching", "open_t+1"),
         _get("entry_fill") or None,
         _get("exit_fill") or None,
-        float(_get("fees_pct", "0.0002")),
+        float(_get("fees_pct", "0.0003")),
         float(_get("slippage_bps", "5")),
         int(_get("max_positions", "10")),
         float(_get("max_exposure_pct", "1")),
@@ -539,9 +543,11 @@ async def strategy_cancel(request: Request):
         _get("overrides") or None,
         _get("mode", "position"),
         int(_get("holding_days", "5")),
-        commission_pct=_get_opt_float("commission_pct"),
-        stamp_tax_pct=_get_opt_float("stamp_tax_pct"),
+        commission_pct=_get_opt_float("commission_pct", "0.0003"),
+        stamp_tax_pct=_get_opt_float("stamp_tax_pct", "0.0005"),
         asset_type=_get("asset_type", "stock"),
+        minute_fill=_get("minute_fill", "false").lower() == "true",
+        benchmark_symbol=_get("benchmark_symbol", "000300.SH"),
     )
     # 持锁读任务表: 与 _cleanup_stale_jobs 的 pop、stream 的写入互斥
     with _jobs_lock:
@@ -574,7 +580,7 @@ def _json_safe(obj):
 _OPT_BT_FIELDS = [
     "matching", "fees_pct", "commission_pct", "stamp_tax_pct", "slippage_bps",
     "max_positions", "max_exposure_pct", "initial_capital", "position_sizing",
-    "mode", "holding_days",
+    "mode", "holding_days", "benchmark_symbol",
 ]
 
 
@@ -601,6 +607,7 @@ def _make_opt_job_key(
 def _opt_backtest_kwargs(
     matching, fees_pct, commission_pct, stamp_tax_pct, slippage_bps,
     max_positions, max_exposure_pct, initial_capital, position_sizing, mode, holding_days,
+    benchmark_symbol="000300.SH",
 ) -> dict:
     return {
         "matching": matching,
@@ -614,6 +621,7 @@ def _opt_backtest_kwargs(
         "position_sizing": position_sizing,
         "mode": mode,
         "holding_days": int(holding_days),
+        "benchmark_symbol": benchmark_symbol,
     }
 
 
@@ -632,13 +640,14 @@ async def optimize_stream(
     start: str | None = None,
     end: str | None = None,
     matching: str = "open_t+1",
-    fees_pct: float = 0.0002,
-    commission_pct: float | None = None,
-    stamp_tax_pct: float | None = None,
+    fees_pct: float = 0.0003,
+    commission_pct: float | None = 0.0003,
+    stamp_tax_pct: float | None = 0.0005,
     slippage_bps: float = 5.0,
     max_positions: int = 10,
     max_exposure_pct: float = 1.0,
     initial_capital: float = 1_000_000.0,
+    benchmark_symbol: str = "000300.SH",
     position_sizing: str = "equal",
     mode: str = "position",
     holding_days: int = 5,
@@ -658,7 +667,7 @@ async def optimize_stream(
         start_date = date.fromisoformat(start)
     else:
         earliest = request.app.state.repo.earliest_daily_date()
-        start_date = earliest or (end_date - timedelta(days=FACTOR_DEFAULT_DAYS))
+        start_date = earliest or (end_date - timedelta(days=STRATEGY_DEFAULT_DAYS))
 
     guard_violated = False
     if settings.backtest_range_guard and (end_date - start_date).days + 1 > BACKTEST_MAX_SERVER_DAYS:
@@ -669,6 +678,7 @@ async def optimize_stream(
     bt_kwargs = _opt_backtest_kwargs(
         matching, fees_pct, commission_pct, stamp_tax_pct, slippage_bps,
         max_positions, max_exposure_pct, initial_capital, position_sizing, mode, holding_days,
+        benchmark_symbol,
     )
     bt_sig = "|".join(f"{k}={bt_kwargs[k]}" for k in _OPT_BT_FIELDS)
     job_key = _make_opt_job_key(
@@ -844,13 +854,14 @@ async def walkforward_stream(
     start: str | None = None,
     end: str | None = None,
     matching: str = "open_t+1",
-    fees_pct: float = 0.0002,
-    commission_pct: float | None = None,
-    stamp_tax_pct: float | None = None,
+    fees_pct: float = 0.0003,
+    commission_pct: float | None = 0.0003,
+    stamp_tax_pct: float | None = 0.0005,
     slippage_bps: float = 5.0,
     max_positions: int = 10,
     max_exposure_pct: float = 1.0,
     initial_capital: float = 1_000_000.0,
+    benchmark_symbol: str = "000300.SH",
     position_sizing: str = "equal",
     mode: str = "position",
     holding_days: int = 5,
@@ -874,6 +885,7 @@ async def walkforward_stream(
     bt_kwargs = _opt_backtest_kwargs(
         matching, fees_pct, commission_pct, stamp_tax_pct, slippage_bps,
         max_positions, max_exposure_pct, initial_capital, position_sizing, mode, holding_days,
+        benchmark_symbol,
     )
     bt_sig = "|".join(f"{k}={bt_kwargs[k]}" for k in _OPT_BT_FIELDS)
     windows = f"{train_days}/{test_days}/{step_days}"

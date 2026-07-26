@@ -431,6 +431,7 @@ class MarketDataMatrix:
     cache_lease: Any | None = field(default=None, compare=False, repr=False)
     vector_fields: frozenset[str] = field(default_factory=frozenset)
     cache_timing_ms: Mapping[str, float] = field(default_factory=dict)
+    data_quality: Mapping[str, Any] = field(default_factory=dict)
     _valid_bars: ValidBarIndex | None = field(
         default=None,
         compare=False,
@@ -495,6 +496,12 @@ class SignalMatrix:
     exit_signal_code: np.ndarray
     entry_signal_ids: tuple[str, ...] = ()
     exit_signal_ids: tuple[str, ...] = ()
+    # NaN means no position adjustment. Finite values are remaining-position
+    # targets expressed as a ratio of the original entry size.
+    target_position_ratio: np.ndarray | None = None
+    risk_ma5: np.ndarray | None = None
+    risk_ma10: np.ndarray | None = None
+    risk_ma20: np.ndarray | None = None
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -538,6 +545,11 @@ class MarketMatrix:
     exit_signal_code: np.ndarray
     entry_signal_ids: tuple[str, ...]
     exit_signal_ids: tuple[str, ...]
+    target_position_ratio: np.ndarray | None = None
+    risk_ma5: np.ndarray | None = None
+    risk_ma10: np.ndarray | None = None
+    risk_ma20: np.ndarray | None = None
+    data_quality: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -883,7 +895,7 @@ def _resolve_matrix_storage_fields(
     matrix_fields = set(parquet_fields)
     vector_fields = {
         name
-        for name in ("total_shares", "float_shares")
+        for name in ("total_shares", "float_shares", "listing_day")
         if name in wanted_fields
         and name in instrument_columns
         and name not in parquet_fields
@@ -896,6 +908,10 @@ def _resolve_matrix_storage_fields(
             vector_fields.add("float_shares")
     if "price_limit_pct" in wanted_fields:
         matrix_fields.add("price_limit_pct")
+    # Older/synthetic datasets may not have instrument metadata. Keep the
+    # field as NaN so strategies can treat an unknown listing date explicitly.
+    if "listing_day" in wanted_fields and "listing_day" not in vector_fields:
+        matrix_fields.add("listing_day")
     resolved = matrix_fields | vector_fields
     unresolved = wanted_fields - resolved
     if unresolved:
@@ -1548,7 +1564,17 @@ def _instrument_fingerprint(instruments: pl.DataFrame | None) -> bytes:
         return b"no-instruments"
     columns = [
         name
-        for name in ("symbol", "name", "total_shares", "float_shares", "limit_up", "limit_down")
+        for name in (
+            "symbol",
+            "name",
+            "total_shares",
+            "float_shares",
+            "limit_up",
+            "limit_down",
+            "listing_day",
+            "list_date",
+            "listing_date",
+        )
         if name in instruments.columns
     ]
     payload = instruments.select(columns).sort("symbol").to_dicts()
@@ -2185,6 +2211,10 @@ def make_signal_matrix(
     exit_signal_code: np.ndarray | None = None,
     entry_signal_ids: tuple[str, ...] = (),
     exit_signal_ids: tuple[str, ...] = (),
+    target_position_ratio: np.ndarray | None = None,
+    risk_ma5: np.ndarray | None = None,
+    risk_ma10: np.ndarray | None = None,
+    risk_ma20: np.ndarray | None = None,
 ) -> SignalMatrix:
     """Create a compact read-only signal matrix with canonical dtypes."""
     entry_array = _coerce_array(entry, shape, np.uint8, 0)
@@ -2192,6 +2222,16 @@ def make_signal_matrix(
     score_array = _coerce_array(score, shape, np.float32, 0.0)
     entry_codes = _coerce_array(entry_signal_code, shape, np.int16, -1)
     exit_codes = _coerce_array(exit_signal_code, shape, np.int16, -1)
+    if target_position_ratio is None:
+        target_ratio = np.where(exit_array != 0, 0.0, np.nan).astype(np.float32)
+    else:
+        target_ratio = _coerce_array(target_position_ratio, shape, np.float32, np.nan)
+        finite_target = np.isfinite(target_ratio)
+        exit_array = np.where(finite_target, 1, exit_array).astype(np.uint8)
+    risk_arrays = [
+        None if value is None else _coerce_array(value, shape, np.float32, np.nan)
+        for value in (risk_ma5, risk_ma10, risk_ma20)
+    ]
     return _finalize_signal_matrix(
         entry_array,
         exit_array,
@@ -2200,6 +2240,10 @@ def make_signal_matrix(
         exit_codes,
         entry_signal_ids=entry_signal_ids,
         exit_signal_ids=exit_signal_ids,
+        target_position_ratio=target_ratio,
+        risk_ma5=risk_arrays[0],
+        risk_ma10=risk_arrays[1],
+        risk_ma20=risk_arrays[2],
     )
 
 
@@ -2212,9 +2256,26 @@ def _finalize_signal_matrix(
     *,
     entry_signal_ids: tuple[str, ...] = (),
     exit_signal_ids: tuple[str, ...] = (),
+    target_position_ratio: np.ndarray | None = None,
+    risk_ma5: np.ndarray | None = None,
+    risk_ma10: np.ndarray | None = None,
+    risk_ma20: np.ndarray | None = None,
 ) -> SignalMatrix:
     shape = entry.shape
-    _make_read_only(entry, exit_, score, entry_signal_code, exit_signal_code)
+    if target_position_ratio is None:
+        target_position_ratio = np.where(exit_ != 0, 0.0, np.nan).astype(np.float32)
+    optional_arrays = [
+        value for value in (target_position_ratio, risk_ma5, risk_ma10, risk_ma20)
+        if value is not None
+    ]
+    _make_read_only(
+        entry,
+        exit_,
+        score,
+        entry_signal_code,
+        exit_signal_code,
+        *optional_arrays,
+    )
     result = SignalMatrix(
         entry=entry,
         exit=exit_,
@@ -2223,6 +2284,10 @@ def _finalize_signal_matrix(
         exit_signal_code=exit_signal_code,
         entry_signal_ids=tuple(entry_signal_ids),
         exit_signal_ids=tuple(exit_signal_ids),
+        target_position_ratio=target_position_ratio,
+        risk_ma5=risk_ma5,
+        risk_ma10=risk_ma10,
+        risk_ma20=risk_ma20,
     )
     validate_signal_matrix(result, shape)
     return result
@@ -2237,6 +2302,15 @@ def validate_signal_matrix(signals: SignalMatrix, shape: tuple[int, int]) -> Non
         "entry_signal_code": (signals.entry_signal_code, np.dtype(np.int16)),
         "exit_signal_code": (signals.exit_signal_code, np.dtype(np.int16)),
     }
+    if signals.target_position_ratio is not None:
+        specs["target_position_ratio"] = (
+            signals.target_position_ratio,
+            np.dtype(np.float32),
+        )
+    for name in ("risk_ma5", "risk_ma10", "risk_ma20"):
+        value = getattr(signals, name)
+        if value is not None:
+            specs[name] = (value, np.dtype(np.float32))
     for name, (array, dtype) in specs.items():
         if not isinstance(array, np.ndarray):
             raise TypeError(f"SignalMatrix.{name} must be a numpy array")
@@ -2250,6 +2324,10 @@ def validate_signal_matrix(signals: SignalMatrix, shape: tuple[int, int]) -> Non
             raise ValueError(f"SignalMatrix.{name} must be read-only")
     if not np.isfinite(signals.score).all():
         raise ValueError("SignalMatrix.score must contain only finite values")
+    if signals.target_position_ratio is not None:
+        finite = signals.target_position_ratio[np.isfinite(signals.target_position_ratio)]
+        if finite.size and ((finite < 0).any() or (finite > 1).any()):
+            raise ValueError("SignalMatrix.target_position_ratio must be within [0, 1]")
 
 
 def build_market_matrix_from_signals(
@@ -2279,6 +2357,15 @@ def build_market_matrix_from_signals(
         present,
         exit_delay_bars,
     )
+    target_position_ratio = np.full(market.shape, np.nan, dtype=np.float32)
+    if signals.target_position_ratio is not None:
+        target_rows, target_assets = np.nonzero(exit_signal_time >= 0)
+        if target_rows.size:
+            source_rows = exit_signal_time[target_rows, target_assets]
+            target_position_ratio[target_rows, target_assets] = signals.target_position_ratio[
+                source_rows,
+                target_assets,
+            ]
 
     if reference_price is not None:
         if reference_price.shape != market.shape:
@@ -2311,6 +2398,7 @@ def build_market_matrix_from_signals(
         exit_signal_time,
         entry_signal_code,
         exit_signal_code,
+        target_position_ratio,
     )
 
     return MarketMatrix(
@@ -2337,6 +2425,11 @@ def build_market_matrix_from_signals(
         exit_signal_code=exit_signal_code,
         entry_signal_ids=signals.entry_signal_ids,
         exit_signal_ids=signals.exit_signal_ids,
+        target_position_ratio=target_position_ratio,
+        risk_ma5=signals.risk_ma5,
+        risk_ma10=signals.risk_ma10,
+        risk_ma20=signals.risk_ma20,
+        data_quality=market.data_quality,
     )
 
 
@@ -2420,6 +2513,7 @@ def slice_market_data_matrix(market: MarketDataMatrix, start: int, stop: int) ->
         cache_lease=market.cache_lease,
         vector_fields=market.vector_fields,
         cache_timing_ms=market.cache_timing_ms,
+        data_quality=market.data_quality,
     )
     _make_read_only(
         result.timestamps,
@@ -2446,6 +2540,14 @@ def slice_signal_matrix(signals: SignalMatrix, start: int, stop: int) -> SignalM
         signals.exit_signal_code[start:stop],
         entry_signal_ids=signals.entry_signal_ids,
         exit_signal_ids=signals.exit_signal_ids,
+        target_position_ratio=(
+            signals.target_position_ratio[start:stop]
+            if signals.target_position_ratio is not None
+            else None
+        ),
+        risk_ma5=signals.risk_ma5[start:stop] if signals.risk_ma5 is not None else None,
+        risk_ma10=signals.risk_ma10[start:stop] if signals.risk_ma10 is not None else None,
+        risk_ma20=signals.risk_ma20[start:stop] if signals.risk_ma20 is not None else None,
     )
 
 
@@ -3472,6 +3574,10 @@ class MatrixStrategyPipeline:
             exit_signal_code=exit_codes,
             entry_signal_ids=signals.entry_signal_ids,
             exit_signal_ids=signals.exit_signal_ids,
+            target_position_ratio=signals.target_position_ratio,
+            risk_ma5=signals.risk_ma5,
+            risk_ma10=signals.risk_ma10,
+            risk_ma20=signals.risk_ma20,
         )
 
 
@@ -3563,6 +3669,14 @@ def _build_basic_filter_mask_uncached(market: MarketDataMatrix, config: dict) ->
             dtype=bool,
         )
         mask &= asset_mask[None, :]
+
+    exclude_new_days = config.get("exclude_new_days")
+    if exclude_new_days is not None and int(exclude_new_days) > 0:
+        listing_day = _optional_field(market, "listing_day")
+        trading_day = (market.timestamps // 86_400_000).astype(np.float32)
+        age_days = trading_day[:, None] - listing_day
+        known_listing_date = np.isfinite(age_days)
+        mask &= ~known_listing_date | (age_days >= int(exclude_new_days))
 
     boards = config.get("boards")
     if isinstance(boards, list) and boards:
@@ -3673,6 +3787,7 @@ def matrix_feature(market: MarketDataMatrix, name: str) -> np.ndarray:
             "low_60d",
             "annual_vol_20d",
             "ma20_bias",
+            "obv",
         }
         or (name.startswith("ma") and name[2:].isdigit())
         or (name.startswith("rsi_") and name[4:].isdigit())
@@ -3737,6 +3852,21 @@ def _compute_matrix_feature(market: MarketDataMatrix, name: str) -> np.ndarray:
             out=out,
             where=volume_valid & np.isfinite(previous_mean) & (previous_mean != 0),
         )
+        return out
+    if name == "obv":
+        previous = valid_shift(market.close, 1, close_valid)
+        signed_volume = np.where(
+            market.close > previous,
+            market.volume,
+            np.where(market.close < previous, -market.volume, 0.0),
+        )
+        signed_volume = np.where(
+            close_valid & np.isfinite(market.volume),
+            signed_volume,
+            0.0,
+        )
+        out = np.cumsum(signed_volume, axis=0, dtype=np.float64).astype(np.float32)
+        out[~close_valid] = np.nan
         return out
     if name == "ma20_bias":
         ma20 = valid_rolling_mean(market.close, close_valid, 20)
@@ -3811,6 +3941,13 @@ def apply_time_masks(
     exit_codes = np.array(signals.exit_signal_code, dtype=np.int16, copy=True)
     entry_codes[entry == 0] = -1
     exit_codes[exit_ == 0] = -1
+    target_position_ratio = (
+        np.array(signals.target_position_ratio, dtype=np.float32, copy=True)
+        if signals.target_position_ratio is not None
+        else None
+    )
+    if target_position_ratio is not None:
+        target_position_ratio[~exit_mask] = np.nan
     return _finalize_signal_matrix(
         entry,
         exit_,
@@ -3819,6 +3956,10 @@ def apply_time_masks(
         exit_codes,
         entry_signal_ids=signals.entry_signal_ids,
         exit_signal_ids=signals.exit_signal_ids,
+        target_position_ratio=target_position_ratio,
+        risk_ma5=signals.risk_ma5,
+        risk_ma10=signals.risk_ma10,
+        risk_ma20=signals.risk_ma20,
     )
 
 

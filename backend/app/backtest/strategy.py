@@ -18,7 +18,13 @@ from typing import Literal
 import numpy as np
 import polars as pl
 
-from app.backtest.engine import BacktestEngine, MatcherConfig, SimResult, SimulationOptions
+from app.backtest.engine import (
+    BacktestEngine,
+    MatcherConfig,
+    SimResult,
+    SimulationOptions,
+    _attach_technical_data_quality,
+)
 from app.backtest.matrix import (
     MarketDataMatrix,
     MatrixCacheProfile,
@@ -45,13 +51,25 @@ from app.strategy.scoring import scoring_dependencies, scoring_value_expr
 
 logger = logging.getLogger(__name__)
 
-BENCHMARK_SYMBOL = "000001.SH"
+DEFAULT_BENCHMARK_SYMBOL = "000300.SH"
+BENCHMARK_NAMES = {
+    "000300.SH": "沪深 300",
+    "000001.SH": "上证指数",
+    "399001.SZ": "深证成指",
+    "399006.SZ": "创业板指",
+}
 _EXECUTION_COLUMNS = frozenset({
     "symbol", "date", "open", "high", "low", "close", "volume",
     "name", "score", "signal_limit_up", "signal_limit_down",
 })
 _LIMIT_BASE_COLUMNS = frozenset({"raw_close", "raw_high"})
-_INSTRUMENT_COLUMNS = frozenset({"name", "total_shares", "float_shares"})
+_INSTRUMENT_COLUMNS = frozenset({"name", "total_shares", "float_shares", "listing_day"})
+_PIT_FINANCIAL_COLUMNS = frozenset({
+    "revenue_yoy",
+    "net_income_yoy",
+    "roe",
+    "debt_to_asset_ratio",
+})
 
 
 @dataclass(frozen=True)
@@ -215,7 +233,16 @@ class StrategyDependencyResolver:
             )
 
         required_features = set(strategy.required_features)
-        required_features.update(strategy.matrix_strategy.required_fields())
+        parameterized_fields = getattr(
+            strategy.matrix_strategy,
+            "required_fields_for_params",
+            None,
+        )
+        required_features.update(
+            parameterized_fields(params)
+            if callable(parameterized_fields)
+            else strategy.matrix_strategy.required_fields()
+        )
         required_features.update(_basic_filter_dependencies(basic_filter))
         scoring = dict(strategy.meta.get("scoring", {}) or {})
         scoring.update(overrides.get("scoring") or {})
@@ -233,6 +260,7 @@ class StrategyDependencyResolver:
             "signal_limit_up",
             "signal_limit_down",
         }
+        matrix_columns.update(required_features & set(_PIT_FINANCIAL_COLUMNS))
         return ResolvedFeaturePlan(
             base_columns=base_columns,
             intermediate_columns=frozenset(),
@@ -428,6 +456,8 @@ def _basic_filter_dependencies(config: dict) -> set[str]:
         dependencies.add("float_shares")
     if config.get("exclude_st"):
         dependencies.add("name")
+    if int(config.get("exclude_new_days") or 0) > 0:
+        dependencies.add("listing_day")
     return dependencies
 
 
@@ -460,13 +490,14 @@ class StrategyBacktestConfig:
     matching: Literal["close_t", "open_t+1"] = "open_t+1"
     entry_fill: Literal["close_t", "open_t+1"] | None = None
     exit_fill: Literal["close_t", "open_t+1", "signal_next_minute"] | None = None
-    fees_pct: float = 0.0002
+    fees_pct: float = 0.0003
     commission_pct: float | None = None
     stamp_tax_pct: float | None = None
     slippage_bps: float = 5.0
     max_positions: int = 10
     max_exposure_pct: float = 1.0
     initial_capital: float = 1_000_000.0
+    benchmark_symbol: str = DEFAULT_BENCHMARK_SYMBOL
     position_sizing: Literal["equal", "score_weight"] = "equal"
     mode: Literal["position", "full"] = "position"
     asset_type: str = "stock"
@@ -796,7 +827,16 @@ class StrategyBacktestService:
         except ValueError as e:
             return _err(str(e))
 
-        params = self._normalize_params(config.params or {}, s)
+        try:
+            self._validate_execution_config(config)
+            params = self._normalize_params(config.params or {}, s)
+            validator = getattr(s.matrix_strategy, "validate_params", None)
+            if callable(validator):
+                validator(params)
+        except ValueError as e:
+            return _err(str(e))
+        # Results must retain the complete effective snapshot, including defaults.
+        config.params = params
         overrides = config.overrides or {}
         basic_filter = self._effective_basic_filter(s, overrides)
         entry_signals = self._effective_signals(overrides, "entry_signals", s.entry_signals)
@@ -981,6 +1021,12 @@ class StrategyBacktestService:
             initial_capital=config.initial_capital,
             position_sizing=config.position_sizing,
             minute_fill=config.minute_fill,
+            dynamic_ma_stop=bool(params.get("enable_dynamic_ma_stop", False)),
+            initial_ma20_buffer_pct=params.get("initial_ma20_buffer"),
+            profit_activation_1_pct=params.get("profit_activation_1"),
+            profit_activation_2_pct=params.get("profit_activation_2"),
+            trailing_ma10_buffer_pct=params.get("trailing_ma10_buffer"),
+            trailing_ma5_buffer_pct=params.get("trailing_ma5_buffer"),
         )
         t_signal = time.perf_counter()
         selection_stats: dict[str, int | bool]
@@ -1151,6 +1197,11 @@ class StrategyBacktestService:
             timing_ms["matrix_build"] = round((time.perf_counter() - t_matrix) * 1000, 1)
             del panel, sim_panel, sim_entry_mask, sim_exit_mask
 
+        try:
+            market_matrix = _attach_technical_data_quality(market_matrix)
+        except ValueError as e:
+            return _err(str(e))
+
         t_sim = time.perf_counter()
 
         # 撮合 — 两条生产路径共享同一只读 MarketMatrix。
@@ -1194,6 +1245,7 @@ class StrategyBacktestService:
         result.stats["full_feature_fallback"] = feature_plan.full_feature_fallback
         result.stats["execution_backend"] = s.execution_backend
         result.stats["selection"] = selection_stats
+        result.stats["data_quality"] = dict(market_matrix.data_quality)
         result.stats["shared_market_data"] = prepared is not None
         result.stats["matrix_data_cache_hit"] = matrix_data_cache_hit
         result.stats["matrix_data_cache_status"] = matrix_data_cache_status
@@ -1204,7 +1256,11 @@ class StrategyBacktestService:
             result.stats["matrix_compute_cache"] = prepared.compute_cache.snapshot()
 
         benchmark_curve = (
-            self._build_benchmark_curve(config.start, config.end)
+            self._build_benchmark_curve(
+                config.start,
+                config.end,
+                config.benchmark_symbol,
+            )
             if result_policy.include_benchmark
             else []
         )
@@ -1490,11 +1546,21 @@ class StrategyBacktestService:
             combined = combined | m
         return combined
 
-    def _build_benchmark_curve(self, start: date, end: date) -> list[dict]:
+    def _build_benchmark_curve(
+        self,
+        start: date,
+        end: date,
+        benchmark_symbol: str,
+    ) -> list[dict]:
         try:
-            df = self.engine.repo.get_index_daily(BENCHMARK_SYMBOL, start, end, columns=["date", "close"])
+            df = self.engine.repo.get_index_daily(
+                benchmark_symbol,
+                start,
+                end,
+                columns=["date", "close"],
+            )
         except Exception as e:
-            logger.warning("load benchmark %s failed: %s", BENCHMARK_SYMBOL, e)
+            logger.warning("load benchmark %s failed: %s", benchmark_symbol, e)
             return []
 
         if df.is_empty() or "close" not in df.columns:
@@ -1509,8 +1575,8 @@ class StrategyBacktestService:
                 "date": str(row["date"])[:10],
                 "value": round(float(row["close"]), 4),
                 "close": round(float(row["close"]), 4),
-                "name": "上证指数",
-                "symbol": BENCHMARK_SYMBOL,
+                "name": BENCHMARK_NAMES.get(benchmark_symbol, benchmark_symbol),
+                "symbol": benchmark_symbol,
             }
             for row in df.iter_rows(named=True)
             if row["close"] is not None
@@ -1586,35 +1652,64 @@ class StrategyBacktestService:
 
     @staticmethod
     def _normalize_params(params: dict, s: StrategyDef) -> dict:
-        normalized = dict(params)
+        normalized: dict = {}
         for param in s.meta.get("params", []):
             pid = param.get("id")
             if not pid:
                 continue
-            value = normalized.get(pid, param.get("default"))
+            value = params.get(pid, param.get("default"))
             p_type = param.get("type")
             if p_type in {"float", "int"}:
                 try:
                     num = float(value)
                 except (TypeError, ValueError):
-                    num = float(param.get("default", 0) or 0)
-                if param.get("min") is not None:
-                    num = max(num, float(param["min"]))
-                if param.get("max") is not None:
-                    num = min(num, float(param["max"]))
+                    raise ValueError(f"参数 {pid} 必须是数值") from None
+                if not np.isfinite(num):
+                    raise ValueError(f"参数 {pid} 必须是有限数值")
+                if param.get("min") is not None and num < float(param["min"]):
+                    raise ValueError(f"参数 {pid} 不能小于 {param['min']}")
+                if param.get("max") is not None and num > float(param["max"]):
+                    raise ValueError(f"参数 {pid} 不能大于 {param['max']}")
+                if p_type == "int" and not num.is_integer():
+                    raise ValueError(f"参数 {pid} 必须是整数")
                 normalized[pid] = int(num) if p_type == "int" else num
             elif p_type == "select" and param.get("options"):
-                normalized[pid] = value if value in param["options"] else param.get("default")
+                if value not in param["options"]:
+                    raise ValueError(
+                        f"参数 {pid} 必须是以下选项之一: {', '.join(map(str, param['options']))}"
+                    )
+                normalized[pid] = value
             elif p_type == "bool":
                 if isinstance(value, bool):
                     normalized[pid] = value
-                elif isinstance(value, str):
+                elif isinstance(value, str) and value.lower() in {"true", "false"}:
                     normalized[pid] = value.lower() == "true"
                 else:
-                    normalized[pid] = bool(param.get("default", False))
+                    raise ValueError(f"参数 {pid} 必须是布尔值")
             else:
                 normalized[pid] = value
         return normalized
+
+    @staticmethod
+    def _validate_execution_config(config: StrategyBacktestConfig) -> None:
+        if config.end < config.start:
+            raise ValueError("回测结束日期不能早于开始日期")
+        if not 10_000 <= float(config.initial_capital) <= 1_000_000_000:
+            raise ValueError("初始资金必须在 1 万至 10 亿之间")
+        if not 1 <= int(config.max_positions) <= 100:
+            raise ValueError("最大持仓数必须在 1 至 100 之间")
+        if not 0.01 <= float(config.max_exposure_pct) <= 1.0:
+            raise ValueError("最大总仓位必须在 1% 至 100% 之间")
+        if not str(config.benchmark_symbol).strip():
+            raise ValueError("基准指数不能为空")
+        costs = {
+            "佣金": config.commission_pct,
+            "印花税": config.stamp_tax_pct,
+            "滑点 bps": config.slippage_bps,
+        }
+        for label, value in costs.items():
+            if value is not None and (not np.isfinite(float(value)) or float(value) < 0):
+                raise ValueError(f"{label}不能为负数或非有限值")
 
     @staticmethod
     def _trade_to_dict(t) -> dict:
@@ -1640,6 +1735,7 @@ class StrategyBacktestService:
             "blocked_exit_days": getattr(t, "blocked_exit_days", 0),
             "entry_signal_id": getattr(t, "entry_signal_id", None),
             "exit_signal_id": getattr(t, "exit_signal_id", None),
+            "exit_legs": list(getattr(t, "exit_legs", None) or []),
         }
 
     @staticmethod
@@ -1672,6 +1768,7 @@ class StrategyBacktestService:
             "max_positions": c.max_positions,
             "max_exposure_pct": c.max_exposure_pct,
             "initial_capital": c.initial_capital,
+            "benchmark_symbol": c.benchmark_symbol,
             "position_sizing": c.position_sizing,
             "mode": c.mode,
             "holding_days": c.holding_days,

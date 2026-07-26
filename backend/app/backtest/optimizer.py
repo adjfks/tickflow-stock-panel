@@ -105,10 +105,15 @@ def _grid_candidates(params_meta: list[dict], param_grid: dict) -> dict[str, lis
     if not param_grid:
         raise ValueError("参数网格为空, 至少需要一个可扫参数")
     by_id = {p["id"]: p for p in params_meta}
+    explicit_optimization_contract = any("optimizable" in p for p in params_meta)
     result: dict[str, list] = {}
     for pid, spec in param_grid.items():
         if pid not in by_id:
             raise ValueError(f"参数 '{pid}' 在该策略中不存在")
+        if explicit_optimization_contract and not by_id[pid].get("optimizable", False):
+            raise ValueError(f"参数 '{pid}' 未标记为 optimizable, 不允许参数扫描")
+        if explicit_optimization_contract and by_id[pid].get("type") not in {"float", "int"}:
+            raise ValueError(f"参数 '{pid}' 不是数值参数, 不允许参数扫描")
         result[pid] = _candidates_for(pid, spec, by_id[pid])
     return result
 

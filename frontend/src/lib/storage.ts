@@ -106,6 +106,7 @@ export const storage = {
     maxPositions: string
     maxExposure: string
     initialCapital: string
+    benchmarkSymbol?: string
     positionSizing: 'equal' | 'score_weight'
     mode: 'position' | 'full'
     holdingDays: string
