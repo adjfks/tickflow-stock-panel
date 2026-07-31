@@ -973,10 +973,10 @@ class KlineRepository:
         warmup_start = target_date - timedelta(days=(lookback_days + 60) * 2)
         if cache_min > warmup_start or cache_max < target_date:
             return None
-        # 按交易日计数裁剪: 从数据里实际存在的交易日序列取最后 lookback_days 个交易日。
-        # 不能用 timedelta(days=N) (自然日), 否则周末/节假日会让窗口只有 ~N×5/7 个交易日,
-        # 导致 filter_history 策略的滚动窗口/行号差(_gap)漏算, 与回测结果不一致。
-        trading_dates = cache["date"].unique().sort()
+        # 按目标日之前的实际交易日计数裁剪。不能从整张缓存的最新日期截取，
+        # 否则查询历史目标日时，目标日之后的交易日会挤掉窗口前端的数据。
+        # 也不能用 timedelta(days=N) (自然日)，否则周末/节假日会让窗口偏短。
+        trading_dates = cache.filter(pl.col("date") <= target_date)["date"].unique().sort()
         if len(trading_dates) > lookback_days:
             lookback_start = trading_dates[-(lookback_days + 1)]
         else:

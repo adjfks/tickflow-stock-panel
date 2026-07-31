@@ -319,6 +319,62 @@ export interface ScreenerCachedResult {
   updated_at: number | null
 }
 
+export type WinRateCombinationKey = 'open_open' | 'open_close' | 'close_open' | 'close_close'
+
+export interface StrategyWinRateStats {
+  signal_count: number
+  valid: number
+  wins: number
+  losses: number
+  flats: number
+  skipped: number
+  skip_reasons?: Record<string, number>
+  win_rate: number | null
+  avg_return: number | null
+  median_return: number | null
+}
+
+export interface StrategyWinRateStrategySummary {
+  strategy_id: string
+  strategy_name: string
+  signal_count: number
+  combinations: Record<WinRateCombinationKey, StrategyWinRateStats>
+}
+
+export interface StrategyWinRateDetail {
+  strategy_id: string
+  strategy_name: string
+  symbol: string
+  name?: string | null
+  board: string
+  signal_date: string
+  buy_date?: string | null
+  sell_date?: string | null
+  buy_open?: number | null
+  buy_close?: number | null
+  sell_open?: number | null
+  sell_close?: number | null
+  returns: Record<WinRateCombinationKey, number | null>
+  statuses: Record<WinRateCombinationKey, string>
+}
+
+export interface StrategyWinRateResult {
+  config: {
+    strategy_ids: string[]
+    start_date: string
+    end_date: string
+    boards: string[]
+  }
+  summary: {
+    signal_count: number
+    strategy_count: number
+    combinations: Record<WinRateCombinationKey, StrategyWinRateStats>
+    strategies: StrategyWinRateStrategySummary[]
+  }
+  combination_labels: Record<WinRateCombinationKey, string>
+  details: StrategyWinRateDetail[]
+}
+
 export interface MarketSnapshotRow {
   symbol: string
   name?: string | null
@@ -958,6 +1014,37 @@ export interface StrategyAlertEvent {
   [key: string]: unknown
 }
 
+export interface LimitUpNextOpenDates {
+  earliest_date: string | null
+  latest_date: string | null
+  available_dates: string[]
+}
+
+export interface LimitUpNextOpenRow {
+  symbol: string
+  name: string
+  buy_price: number
+  sell_price: number | null
+  return_pct: number | null
+  outcome: 'profit' | 'loss' | 'flat' | 'unavailable'
+}
+
+export interface LimitUpNextOpenResult {
+  trade_date: string
+  exit_date: string
+  summary: {
+    total: number
+    valid: number
+    wins: number
+    losses: number
+    flats: number
+    unavailable: number
+    win_rate: number | null
+    average_return: number | null
+  }
+  rows: LimitUpNextOpenRow[]
+}
+
 // ===== API surface =====
 export const api = {
   health: () => request<{ status: string; version: string; mode: string }>('/health'),
@@ -1444,6 +1531,16 @@ export const api = {
     request<{ as_of: string | null; results: Record<string, ScreenerResultSummary> }>(
       '/api/screener/run_all', { method: 'POST', body: JSON.stringify({ as_of: asOf ?? null, strategy_ids: strategyIds ?? null, asset_type: assetType, timeframe: '1d', summary_only: true }) },
     ),
+  screenerWinRate: (payload: {
+    strategy_ids: string[]
+    start_date: string
+    end_date: string
+    boards: string[]
+  }) =>
+    request<StrategyWinRateResult>('/api/screener/win-rate', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
   screenerCachedSummary: () =>
     request<ScreenerCachedSummary>('/api/screener/cached-summary'),
   screenerCachedResult: (strategyId: string, extColumns?: string) =>
@@ -1478,6 +1575,18 @@ export const api = {
   },
 
   backtestStatus: () => request<{ available: boolean }>('/api/backtest/status'),
+
+  limitUpNextOpenDates: () =>
+    request<LimitUpNextOpenDates>('/api/backtest/limit-up-next-open/dates'),
+
+  limitUpNextOpen: (payload: { tradeDate: string; excludeRiskBoards: boolean }) =>
+    request<LimitUpNextOpenResult>('/api/backtest/limit-up-next-open', {
+      method: 'POST',
+      body: JSON.stringify({
+        trade_date: payload.tradeDate,
+        exclude_risk_boards: payload.excludeRiskBoards,
+      }),
+    }),
 
   backtestRun: (payload: {
     symbols: string[]

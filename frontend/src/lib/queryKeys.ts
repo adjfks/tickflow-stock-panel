@@ -43,6 +43,7 @@ export const QK = {
 
   // Backtest
   backtestStatus:       ['backtest-status'] as const,
+  limitUpNextOpenDates: ['limit-up-next-open-dates'] as const,
   strategyDetail:       (id: string) => ['strategy-detail', id] as const,
 
   // Data / Pipeline

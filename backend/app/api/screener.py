@@ -42,6 +42,13 @@ class PresetRequest(BaseModel):
     timeframe: str = "1d"
 
 
+class WinRateRequest(BaseModel):
+    strategy_ids: list[str]
+    start_date: date
+    end_date: date
+    boards: list[str]
+
+
 def _safe(result_dict: dict) -> dict:
     """sanitize for JSON(NaN / Inf → None)."""
     rows = result_dict.get("rows", [])
@@ -321,6 +328,26 @@ def run_preset(req: PresetRequest, request: Request):
     return _result_with_ext(safe_data, ext_values)
 
 
+@router.post("/win-rate")
+def win_rate(req: WinRateRequest, request: Request):
+    """Calculate fixed T+1 buy / T+2 sell returns for screener signals."""
+    engine = getattr(request.app.state, "strategy_engine", None)
+    if engine is None:
+        raise HTTPException(status_code=503, detail="策略引擎未初始化")
+    try:
+        from app.services.strategy_win_rate import StrategyWinRateService
+
+        return StrategyWinRateService(request.app.state.repo, engine).calculate(
+            req.strategy_ids,
+            req.start_date,
+            req.end_date,
+            req.boards,
+        )
+    except ValueError as exc:
+        status_code = 404 if "unknown strateg" in str(exc) else 400
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+
+
 def _cached_with_realtime(request: Request) -> dict:
     """读取盘后缓存，并用监控引擎的实时结果覆盖同策略。"""
     data_dir = request.app.state.repo.store.data_dir
@@ -427,7 +454,15 @@ def get_cached_result(
     }
 
     ever_rows = None
-    if cached.get("as_of") == result["as_of"]:
+    # `today_ever_rows` is an intraday-only view. Never expose it for a
+    # historical cache date, otherwise historical screening can show rows
+    # that were only matched during the latest trading session.
+    latest_date = ScreenerService(request.app.state.repo).latest_date()
+    if (
+        cached.get("as_of") == result["as_of"]
+        and latest_date is not None
+        and result["as_of"] == str(latest_date)
+    ):
         strategy_ever_rows = (cached.get("today_ever_rows") or {}).get(strategy_id)
         if isinstance(strategy_ever_rows, dict):
             ever_rows = {

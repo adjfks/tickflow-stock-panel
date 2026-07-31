@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
-import { ScanSearch, Clock, TrendingUp, Star, Filter, Layers, Network, Sparkles, RefreshCw, Settings2, Store, RotateCcw, X } from 'lucide-react'
+import { ScanSearch, Clock, TrendingUp, Star, Filter, Layers, Network, Sparkles, RefreshCw, Settings2, Store, RotateCcw, X, BarChart3 } from 'lucide-react'
 import { api, genRuleId, type ScreenerStrategy, type ScreenerResult } from '@/lib/api'
 import { toast } from '@/components/Toast'
 import { useDataStatus, usePreferences, useCapabilities, useQuoteStatus } from '@/lib/useSharedQueries'
@@ -21,6 +21,7 @@ import { StrategySettingsDialog } from '@/components/screener/StrategySettingsDi
 import { StrategyPoolDialog } from '@/components/screener/StrategyPoolDialog'
 import { StrategyBuilderDialog } from '@/components/screener/StrategyBuilderDialog'
 import { StrategyStoreDialog } from '@/components/screener/StrategyStoreDialog'
+import { StrategyWinRatePanel } from '@/components/screener/StrategyWinRatePanel'
 import { ListColumnCustomizer } from '@/components/ListColumnCustomizer'
 import { useTableSort } from '@/components/stock-table/useTableSort'
 import { resolveCandleConfig } from '@/lib/list-columns'
@@ -47,6 +48,7 @@ export function Screener() {
   const [showBuilder, setShowBuilder] = useState(false)
   const [builderMode, setBuilderMode] = useState<'create' | 'modify'>('create')
   const [showStore, setShowStore] = useState(false)
+  const [showWinRate, setShowWinRate] = useState(false)
   const { pool, addToPool, removeFromPool, reorderPool, prune } = useStrategyPool()
   const [cardSize, setCardSize] = useState<CardSize>(loadCardSize)
   // 日k蜡烛图显示开关（仅当 candle 列可见时才有意义；持久化）
@@ -147,6 +149,8 @@ export function Screener() {
   })
 
   const dataStatus = useDataStatus({ staleTime: 0 })
+  const minDate = dataStatus.data?.enriched?.earliest_date ?? ''
+  const maxDate = dataStatus.data?.enriched?.latest_date ?? ''
 
   // 默认日期 = enriched 最新日期（始终跟随最新）
   useEffect(() => {
@@ -242,11 +246,11 @@ export function Screener() {
       counts[id] = r.total
       const everCount = summaryQuery.data.today_ever_counts[id] ?? r.total
       const expiredCount = Math.max(everCount - r.total, 0)
-      if (expiredCount > 0) expired[id] = expiredCount
+      if (asOf === maxDate && expiredCount > 0) expired[id] = expiredCount
     }
     setHitCounts(counts)
     setExpiredCounts(expired)
-  }, [summaryQuery.data, asOf])
+  }, [summaryQuery.data, asOf, maxDate])
 
   // 当前单策略缓存更新后同步明细；参数保存的强制重算结果仍由 run 直接覆盖。
   useEffect(() => {
@@ -308,12 +312,12 @@ export function Screener() {
   // 计算当前策略的失效行: 今日曾命中但当前已不命中。
   const expiredRows = useMemo(() => {
     const everRows = singleCachedQuery.data?.today_ever_rows
-    if (!everRows || !result || result.as_of !== asOf) return []
+    if (asOf !== maxDate || !everRows || !result || result.as_of !== asOf) return []
     const currentSymbols = new Set(result.rows.map((row: any) => row.symbol))
     return Object.entries(everRows)
       .filter(([symbol]) => !currentSymbols.has(symbol))
       .map(([, row]) => ({ ...row, _expired: true }))
-  }, [singleCachedQuery.data, result, asOf])
+  }, [singleCachedQuery.data, result, asOf, maxDate])
 
   // 表头排序（受控）：用户点击列则按该列；未点时下方按评分默认降序
   const { sort, toggle, sortRows } = useTableSort()
@@ -470,9 +474,6 @@ export function Screener() {
     runAllDateRef.current = null
     setResult(null)
   }
-
-  const minDate = dataStatus.data?.enriched?.earliest_date ?? ''
-  const maxDate = dataStatus.data?.enriched?.latest_date ?? ''
 
   const batchAdd = useWatchlistBatchAdd()
 
@@ -646,6 +647,17 @@ export function Screener() {
                 {visiblePool.length}/{strategyPresets.length}
               </span>
             </button>
+            {assetType === 'stock' && (
+              <button
+                onClick={() => setShowWinRate(true)}
+                className="inline-flex items-center gap-1.5 h-7 px-3 rounded-btn
+                  border border-accent/30 bg-accent/8 text-xs font-medium text-accent
+                  hover:bg-accent/15 transition-colors cursor-pointer"
+              >
+                <BarChart3 className="h-3.5 w-3.5" />
+                策略胜率
+              </button>
+            )}
             {/* 创建策略 */}
             <button
               onClick={() => { setBuilderMode('create'); setShowBuilder(true) }}
@@ -979,6 +991,18 @@ export function Screener() {
         open={showStore}
         onClose={() => setShowStore(false)}
       />
+
+      {showWinRate && (
+        <StrategyWinRatePanel
+          open={showWinRate}
+          strategies={strategyPresets}
+          minDate={minDate}
+          maxDate={maxDate}
+          defaultStart=""
+          defaultEnd={asOf || maxDate}
+          onClose={() => setShowWinRate(false)}
+        />
+      )}
     </>
   )
 }
